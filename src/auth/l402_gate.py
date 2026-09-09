@@ -26,10 +26,12 @@ class L402PreAllocationGate:
         settlement_client_or_url: Optional[Any] = None,
         verification_key: str = "settlement-secret-verification-key-12345",
         min_price_rate: float = 0.0005,
+        min_task_sats: int = 10,
     ) -> None:
         self.settlement_client = settlement_client_or_url
         self.verification_key = verification_key
         self.min_price_rate = float(min_price_rate)
+        self.min_task_sats = int(min_task_sats)
 
     def parse_auth_header(self, auth_header: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -72,9 +74,9 @@ class L402PreAllocationGate:
         Executes the 5-Step Pre-Allocation Validation Gate:
         1. Header Extraction: Parses 'Authorization: L402 <macaroon>:<payment_hash>'.
         2. HMAC Verification: Cryptographically validates Macaroon against verification_key.
-        3. Task Caveats: Asserts caveat.task_id == task_id and caveat.expiry > current_time.
-        4. Workload Bounding: Asserts caveat.max_gflops >= (2*M*N*K)/1e9 and payment sufficiency.
-        5. Settlement Lock Check: Asserts payment_hash status is actively HELD.
+        3. Task Caveats: Asserts caveat.task_id == task_id, caveat.payment_hash == payment_hash, and caveat.expiry > current_time.
+        4. Workload Bounding: Asserts caveat.max_gflops >= (2*M*N*K)/1e9 and payment sufficiency with min_task_sats floor.
+        5. Settlement Lock Check: Asserts payment_hash status is actively HELD (via httpx for URLs, client object, or fail-closed).
 
         Returns:
             (is_valid, error_message, error_code)
@@ -110,12 +112,20 @@ class L402PreAllocationGate:
         if not hmac.compare_digest(signature, expected_sig):
             return False, "Invalid macaroon HMAC signature", "UNAUTHENTICATED"
 
-        # Step 3: Task & Expiry Caveats
+        # Step 3: Task, Payment Hash & Expiry Caveats
         caveat_task_id = caveats.get("task_id")
         if caveat_task_id != task_id:
             return (
                 False,
                 f"Macaroon caveat task_id '{caveat_task_id}' does not match requested task '{task_id}'",
+                "PERMISSION_DENIED",
+            )
+
+        caveat_payment_hash = caveats.get("payment_hash")
+        if caveat_payment_hash != payment_hash:
+            return (
+                False,
+                f"Macaroon caveat payment_hash '{caveat_payment_hash}' does not match Authorization payment_hash '{payment_hash}'",
                 "PERMISSION_DENIED",
             )
 
@@ -134,10 +144,13 @@ class L402PreAllocationGate:
                 "PERMISSION_DENIED",
             )
 
-        # Rate check if locked_sats is specified
-        locked_sats = caveats.get("locked_sats")
-        if locked_sats is not None and isinstance(locked_sats, (int, float)):
-            required_sats = math.ceil(requested_gflops * self.min_price_rate)
+        # Rate check if locked_sats is specified with min_task_sats floor
+        if "locked_sats" in caveats:
+            locked_sats = caveats["locked_sats"]
+            if not isinstance(locked_sats, (int, float)):
+                return False, "Malformed locked_sats caveat: must be numeric", "UNAUTHENTICATED"
+            computed_sats = math.ceil(requested_gflops * self.min_price_rate)
+            required_sats = max(computed_sats, self.min_task_sats)
             if locked_sats < required_sats:
                 return (
                     False,
@@ -146,18 +159,52 @@ class L402PreAllocationGate:
                 )
 
         # Step 5: Settlement HODL Lock Verification
-        if self.settlement_client is not None:
-            status = None
-            if hasattr(self.settlement_client, "get_status"):
-                status = self.settlement_client.get_status(payment_hash)
-            elif callable(self.settlement_client):
-                status = self.settlement_client(payment_hash)
+        if not self.settlement_client:
+            return (
+                False,
+                "Settlement verification is unconfigured (fail-closed)",
+                None,
+            )
 
-            if status != "HELD":
+        status = None
+        if isinstance(self.settlement_client, str) and (
+            self.settlement_client.startswith("http://") or self.settlement_client.startswith("https://")
+        ):
+            base_url = self.settlement_client.rstrip("/")
+            try:
+                import httpx
+                with httpx.Client(timeout=5.0) as client:
+                    resp = client.get(f"{base_url}/invoices/{payment_hash}")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, dict):
+                            raw_status = data.get("status") or data.get("invoice_status")
+                            status = str(raw_status).strip().upper() if raw_status else None
+                        elif isinstance(data, str):
+                            status = data.strip().upper()
+                        else:
+                            status = None
+                    else:
+                        status = None
+            except Exception as ex:
+                logger.warning("HTTP settlement verification query failed: %s", ex)
                 return (
                     False,
-                    f"Payment hash '{payment_hash}' is in state '{status}', expected 'HELD'",
+                    f"Settlement HTTP query failed: {ex}",
                     "FAILED_PRECONDITION",
                 )
+        elif hasattr(self.settlement_client, "get_status"):
+            raw_status = self.settlement_client.get_status(payment_hash)
+            status = str(raw_status).strip().upper() if raw_status else None
+        elif callable(self.settlement_client):
+            raw_status = self.settlement_client(payment_hash)
+            status = str(raw_status).strip().upper() if raw_status else None
+
+        if status != "HELD":
+            return (
+                False,
+                f"Payment hash '{payment_hash}' is in state '{status}', expected 'HELD'",
+                "FAILED_PRECONDITION",
+            )
 
         return True, None, None

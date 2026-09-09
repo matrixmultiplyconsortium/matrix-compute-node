@@ -118,7 +118,8 @@ class OpaqueL402Helper:
         task_id: str,
         expiry_timestamp: int,
         max_gflops: float,
-        locked_sats: int = 100
+        locked_sats: int = 100,
+        payment_hash: Optional[str] = None,
     ) -> str:
         """Mints an HMAC-SHA256 authenticated macaroon payload."""
         caveats = {
@@ -127,6 +128,8 @@ class OpaqueL402Helper:
             "max_gflops": max_gflops,
             "locked_sats": locked_sats
         }
+        if payment_hash is not None:
+            caveats["payment_hash"] = payment_hash
         caveat_str = json.dumps(caveats, sort_keys=True)
         sig = hmac.new(verification_key.encode("utf-8"), caveat_str.encode("utf-8"), hashlib.sha256).hexdigest()
         payload = {"caveats": caveats, "signature": sig}
@@ -511,7 +514,8 @@ class TestTier1FeatureCoverage:
             task_id=task_id,
             expiry_timestamp=int(time.time()) + 3600,
             max_gflops=1.0,
-            locked_sats=100
+            locked_sats=100,
+            payment_hash="payment_hash_held_001",
         )
         auth_header = OpaqueL402Helper.format_auth_header(macaroon, "payment_hash_held_001")
         # In mock settlement, payment_hash_held_001 is HELD
@@ -560,7 +564,8 @@ class TestTier1FeatureCoverage:
             verification_key="vkey",
             task_id="task_abc",
             expiry_timestamp=int(time.time()) + 3600,
-            max_gflops=1.0
+            max_gflops=1.0,
+            payment_hash="hash_1",
         )
         auth_header = OpaqueL402Helper.format_auth_header(macaroon, "hash_1")
         if hasattr(gate, "verify_token"):
@@ -577,7 +582,8 @@ class TestTier1FeatureCoverage:
             verification_key="vkey",
             task_id="task_expired",
             expiry_timestamp=int(time.time()) - 3600,  # 1 hour ago
-            max_gflops=1.0
+            max_gflops=1.0,
+            payment_hash="hash_1",
         )
         auth_header = OpaqueL402Helper.format_auth_header(macaroon, "hash_1")
         if hasattr(gate, "verify_token"):
@@ -1156,7 +1162,8 @@ class TestTier4RealWorldScenarios:
             task_id=task_id,
             expiry_timestamp=int(time.time()) + 3600,
             max_gflops=gflops * 1.5,
-            locked_sats=req_sats
+            locked_sats=req_sats,
+            payment_hash=payment_hash,
         )
         auth_header = OpaqueL402Helper.format_auth_header(macaroon, payment_hash)
         assert "L402" in auth_header

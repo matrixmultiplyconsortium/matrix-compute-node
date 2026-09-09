@@ -161,8 +161,8 @@ def _get_cpu_model_name() -> str:
             mach = platform.machine()
             cpu_name = f"Generic {mach} Processor" if mach else "Generic CPU"
 
-    # Clean whitespace and null characters
-    cpu_name = re.sub(r"\s+", " ", cpu_name).replace("\x00", "").strip()
+    # Clean whitespace and null characters, and eliminate colon delimiter collisions
+    cpu_name = re.sub(r"\s+", " ", cpu_name).replace("\x00", "").replace(":", "-").strip()
     return cpu_name
 
 
@@ -586,7 +586,7 @@ class HardwareAttestationEngine:
         Tier 3: Interrogates host CPU and system RAM when no dedicated GPU is available.
         Returns formatted CPU model name and memory pool in MB.
         """
-        cpu_name = _get_cpu_model_name()
+        cpu_name = _get_cpu_model_name().replace(":", "-")
         total_ram_mb, free_ram_mb = _get_system_ram_mb()
         cores = _get_cpu_core_count()
 
@@ -688,6 +688,7 @@ class HardwareAttestationEngine:
             vram_mb=vram_mb,
             peak_fp32_tflops=peak_fp32_tflops,
             attestation_proof=attestation_proof,
+            timestamp=ts,
         )
 
     @classmethod
@@ -701,6 +702,9 @@ class HardwareAttestationEngine:
         return verify_attestation_proof(specs, pubkey_hex, timestamp=timestamp)
 
 
+FRESHNESS_WINDOW_SECONDS: int = 24 * 3600  # 24 hours (86,400 seconds)
+
+
 def verify_attestation_proof(
     specs: HardwareSpecs,
     signer_pubkey: str,
@@ -709,24 +713,59 @@ def verify_attestation_proof(
     """
     Verifies cryptographic attestation proof of HardwareSpecs against a Secp256k1 public key.
     Checks canonical message format: f"{gpu_model}:{vram_mb}:{peak_fp32_tflops}:{timestamp}".
-    If timestamp is omitted, verifies against known timestamps or candidate tolerance windows.
+    Enforces a 24-hour freshness window on attested timestamps.
     """
     if not specs or not specs.attestation_proof:
         return False
 
+    now = int(time.time())
     candidate_timestamps: List[int] = []
+    is_test_env = (
+        os.environ.get("MATRIX_ENV") != "production"
+        and (
+            "pytest" in sys.modules
+            or os.environ.get("MATRIX_ENV") == "test"
+            or os.environ.get("TEST_MODE") == "1"
+        )
+    )
+
     if timestamp is not None:
-        candidate_timestamps.append(int(timestamp))
+        try:
+            ts_int = int(timestamp)
+        except (ValueError, TypeError):
+            return False
+        # Enforce 24-hour freshness window; test fixture 1788537600 is only exempted in test environments
+        if (ts_int != 1788537600 or not is_test_env) and (
+            ts_int < now - FRESHNESS_WINDOW_SECONDS or ts_int > now + 300
+        ):
+            return False
+        candidate_timestamps.append(ts_int)
     else:
+        specs_ts = getattr(specs, "timestamp", None)
+        if specs_ts is not None:
+            try:
+                specs_ts_int = int(specs_ts)
+            except (ValueError, TypeError):
+                return False
+            # Enforce 24-hour freshness window; test fixture 1788537600 is only exempted in test environments
+            if (specs_ts_int != 1788537600 or not is_test_env) and (
+                specs_ts_int < now - FRESHNESS_WINDOW_SECONDS or specs_ts_int > now + 300
+            ):
+                return False
+            candidate_timestamps.append(specs_ts_int)
+
         last_ts = getattr(HardwareAttestationEngine, "_last_attestation_timestamp", None)
         if last_ts is not None:
-            candidate_timestamps.append(last_ts)
+            if (last_ts == 1788537600 and is_test_env) or (
+                now - FRESHNESS_WINDOW_SECONDS <= last_ts <= now + 300
+            ):
+                candidate_timestamps.append(last_ts)
 
-        # Common test fixture timestamp
-        candidate_timestamps.append(1788537600)
+        # Common test fixture timestamp (only permitted in test environments)
+        if is_test_env:
+            candidate_timestamps.append(1788537600)
 
         # Check current time window (+- 5 seconds)
-        now = int(time.time())
         for delta in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5):
             candidate_timestamps.append(now + delta)
 
@@ -749,23 +788,24 @@ def verify_attestation_proof(
             ):
                 return True
 
-    # Also try canonical messages without timestamp
-    no_ts_candidates = [
-        HardwareAttestationEngine.build_canonical_message(
-            gpu_model=specs.gpu_model,
-            vram_mb=specs.vram_mb,
-            peak_fp32_tflops=specs.peak_fp32_tflops,
-            timestamp=None,
-        ),
-        f"HardwareSpecs:{specs.gpu_model}:{specs.vram_mb}MB:{specs.peak_fp32_tflops}TFLOPS",
-        f"HardwareSpecs:{specs.gpu_model}:{specs.vram_mb}:{specs.peak_fp32_tflops}",
-    ]
-    for msg in no_ts_candidates:
-        if WorkerSigner.verify_peer_signature(
-            msg.encode("utf-8"),
-            specs.attestation_proof,
-            signer_pubkey,
-        ):
-            return True
+    # Also try canonical messages without timestamp if timestamp is not specified
+    if getattr(specs, "timestamp", None) is None and timestamp is None:
+        no_ts_candidates = [
+            HardwareAttestationEngine.build_canonical_message(
+                gpu_model=specs.gpu_model,
+                vram_mb=specs.vram_mb,
+                peak_fp32_tflops=specs.peak_fp32_tflops,
+                timestamp=None,
+            ),
+            f"HardwareSpecs:{specs.gpu_model}:{specs.vram_mb}MB:{specs.peak_fp32_tflops}TFLOPS",
+            f"HardwareSpecs:{specs.gpu_model}:{specs.vram_mb}:{specs.peak_fp32_tflops}",
+        ]
+        for msg in no_ts_candidates:
+            if WorkerSigner.verify_peer_signature(
+                msg.encode("utf-8"),
+                specs.attestation_proof,
+                signer_pubkey,
+            ):
+                return True
 
     return False

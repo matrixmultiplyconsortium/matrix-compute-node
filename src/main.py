@@ -54,6 +54,7 @@ class WorkerDaemon:
             settlement_client_or_url=settlement_client or config.settlement_api_url,
             verification_key=config.settlement_verification_key,
             min_price_rate=config.sats_per_gflop,
+            min_task_sats=config.min_task_sats,
         )
 
         # 4. Compute Engine
@@ -151,7 +152,7 @@ class WorkerDaemon:
 
 def main(args: Optional[Sequence[str]] = None) -> int:
     """CLI entrypoint."""
-    config = NodeConfig.from_cli_and_env(args)
+    config = NodeConfig.load(args)
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

@@ -16,12 +16,20 @@ from src.p2p.servicer import MatrixComputeServicer
 from src.test_doubles.mock_settlement import MockSettlementService
 
 
-def mint_macaroon(key: str, task_id: str, expiry: int, max_gflops: float, locked_sats: int = 100) -> str:
+def mint_macaroon(
+    key: str,
+    task_id: str,
+    expiry: int,
+    max_gflops: float,
+    locked_sats: int = 100,
+    payment_hash: str = "default_servicer_ph",
+) -> str:
     caveats = {
         "task_id": task_id,
         "expiry": expiry,
         "max_gflops": max_gflops,
         "locked_sats": locked_sats,
+        "payment_hash": payment_hash,
     }
     caveat_str = json.dumps(caveats, sort_keys=True)
     sig = hmac.new(key.encode("utf-8"), caveat_str.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -121,7 +129,7 @@ def test_execute_tile_task_unpaid_invoice_aborts(servicer, mock_settlement, vkey
     inv = mock_settlement.create_hodl_invoice(task_id)
     # Don't hold invoice -> UNPAID
 
-    mac = mint_macaroon(vkey, task_id, int(time.time()) + 3600, 1.0)
+    mac = mint_macaroon(vkey, task_id, int(time.time()) + 3600, 1.0, payment_hash=inv.payment_hash)
     ctx = MockGrpcContext(metadata=[("authorization", f"L402 {mac}:{inv.payment_hash}")])
 
     with pytest.raises(RuntimeError, match="UNPAID"):
@@ -148,7 +156,7 @@ def test_execute_tile_task_full_lifecycle(servicer, mock_settlement, signer, vke
     mock_settlement.hold_invoice(inv.payment_hash)
 
     # 3. Create L402 token
-    mac = mint_macaroon(vkey, task_id, int(time.time()) + 3600, max_gflops=1.0)
+    mac = mint_macaroon(vkey, task_id, int(time.time()) + 3600, max_gflops=1.0, payment_hash=inv.payment_hash)
     auth_header = f"L402 {mac}:{inv.payment_hash}"
 
     # 4. Prepare data stream

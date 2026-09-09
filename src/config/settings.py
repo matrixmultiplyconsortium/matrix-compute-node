@@ -256,11 +256,11 @@ class NodeConfig(BaseModel):
         return cls(**data)
 
     @classmethod
-    def create_arg_parser(cls) -> argparse.ArgumentParser:
+    def create_arg_parser(cls, add_help: bool = True) -> argparse.ArgumentParser:
         """Builds CLI argument parser."""
         parser = argparse.ArgumentParser(
             description="matrix-compute-node daemon CLI options",
-            add_help=False,
+            add_help=add_help,
         )
         parser.add_argument(
             "--worker-privkey",
@@ -385,3 +385,7 @@ class NodeConfig(BaseModel):
 
         merged = {**base_config, **cli_dict}
         return cls(**merged)
+
+    # Alias for backwards-compatibility and CLI invocations
+    from_cli_and_env = load
+

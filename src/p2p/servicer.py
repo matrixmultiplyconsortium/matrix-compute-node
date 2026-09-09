@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Iterator, Optional
 
 import grpc
@@ -16,6 +17,66 @@ from src.crypto.signer import WorkerSigner
 from src.engine.compute_core import ComputeEngine
 
 logger = logging.getLogger(__name__)
+
+
+class TaskMetadataStore:
+    """Thread-safe bounded LRU and TTL store for negotiated task metadata."""
+
+    def __init__(self, max_size: int = 1000, ttl_seconds: float = 3600.0) -> None:
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._store: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def evict_expired(self, now: Optional[float] = None) -> None:
+        current_time = now if now is not None else time.time()
+        with self._lock:
+            expired_keys = [
+                k for k, v in self._store.items()
+                if current_time - v.get("created_at", 0) > self.ttl_seconds
+            ]
+            for k in expired_keys:
+                self._store.pop(k, None)
+
+    def get(self, task_id: str, default: Any = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            self.evict_expired()
+            if task_id in self._store:
+                self._store.move_to_end(task_id)
+                return self._store[task_id]
+            return default
+
+    def set(self, task_id: str, data: Dict[str, Any]) -> None:
+        with self._lock:
+            self.evict_expired()
+            if task_id in self._store:
+                self._store.move_to_end(task_id)
+            self._store[task_id] = data
+            while len(self._store) > self.max_size:
+                self._store.popitem(last=False)
+
+    def pop(self, task_id: str, default: Any = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._store.pop(task_id, default)
+
+    def __getitem__(self, task_id: str) -> Dict[str, Any]:
+        val = self.get(task_id)
+        if val is None:
+            raise KeyError(task_id)
+        return val
+
+    def __setitem__(self, task_id: str, data: Dict[str, Any]) -> None:
+        self.set(task_id, data)
+
+    def __contains__(self, task_id: str) -> bool:
+        with self._lock:
+            self.evict_expired()
+            return task_id in self._store
+
+    def __len__(self) -> int:
+        with self._lock:
+            self.evict_expired()
+            return len(self._store)
 
 
 class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
@@ -38,7 +99,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         self.engine = engine or ComputeEngine()
         self.config = config
         self._lock = threading.Lock()
-        self._task_metadata: Dict[str, Dict[str, Any]] = {}
+        self._task_metadata = TaskMetadataStore(max_size=1000, ttl_seconds=3600.0)
 
     def RequestTileTask(
         self,
@@ -139,112 +200,135 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         if not task_id:
             self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Unable to determine task_id from L402 token")
 
-        with self._lock:
+        try:
             task_info = self._task_metadata.get(task_id)
 
-        if task_info:
-            m = task_info["m"]
-            k = task_info["k"]
-            n = task_info["n"]
-            dtype = task_info["dtype"]
-        else:
-            # If not pre-registered, default or extract from metadata
-            m = 1
-            k = 1
-            n = 1
-            dtype = "fp32"
+            m = task_info["m"] if task_info else 1
+            k = task_info["k"] if task_info else 1
+            n = task_info["n"] if task_info else 1
+            dtype = task_info["dtype"] if task_info else "fp32"
 
-        # Execute 5-step gate verification BEFORE allocating memory
-        ok, err_msg, err_code = self.gate.verify_token(auth_header, task_id, m=m, k=k, n=n)
-        if not ok:
-            status = grpc.StatusCode.UNAUTHENTICATED
-            if err_code == "PERMISSION_DENIED":
-                status = grpc.StatusCode.PERMISSION_DENIED
-            elif err_code == "FAILED_PRECONDITION":
-                status = grpc.StatusCode.FAILED_PRECONDITION
-            self._abort(context, status, err_msg or "L402 Pre-allocation check failed")
+            # Execute 5-step gate verification BEFORE allocating memory
+            ok, err_msg, err_code = self.gate.verify_token(auth_header, task_id, m=m, k=k, n=n)
+            if not ok:
+                status = grpc.StatusCode.UNAUTHENTICATED
+                if err_code == "PERMISSION_DENIED":
+                    status = grpc.StatusCode.PERMISSION_DENIED
+                elif err_code == "FAILED_PRECONDITION":
+                    status = grpc.StatusCode.FAILED_PRECONDITION
+                self._abort(context, status, err_msg or "L402 Pre-allocation check failed")
 
-        # 3. Stream Ingestion & Chunk Assembly (Only reached if Gate Passed)
-        a_byte_chunks = []
-        b_byte_chunks = []
-        expected_seq = 0
-        final_seen = False
+            if not task_info:
+                self._abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"Task '{task_id}' was not negotiated via RequestTileTask",
+                )
 
-        for chunk in request_iterator:
-            if chunk.sequence_number != expected_seq:
+            np_dtype = np.float32 if dtype in ("fp32", "bf16") else np.float16
+            bytes_per_elem = 4 if np_dtype == np.float32 else 2
+
+            expected_a_bytes = m * k * bytes_per_elem
+            expected_b_bytes = k * n * bytes_per_elem
+
+            # 3. Stream Ingestion & Chunk Assembly (with strict running byte bounds)
+            a_byte_chunks = []
+            b_byte_chunks = []
+            running_a_bytes = 0
+            running_b_bytes = 0
+            expected_seq = 0
+            final_seen = False
+
+            for chunk in request_iterator:
+                if chunk.sequence_number != expected_seq:
+                    self._abort(
+                        context,
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"Out of order chunk: expected seq {expected_seq}, got {chunk.sequence_number}",
+                    )
+
+                if chunk.task_id != task_id:
+                    self._abort(
+                        context,
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"Chunk task_id mismatch: expected '{task_id}', got '{chunk.task_id}'",
+                    )
+
+                chunk_bytes = chunk.chunk_bytes if chunk.chunk_bytes is not None else b""
+                chunk_len = len(chunk_bytes)
+
+                if chunk.is_matrix_a:
+                    if running_a_bytes + chunk_len > expected_a_bytes:
+                        self._abort(
+                            context,
+                            grpc.StatusCode.INVALID_ARGUMENT,
+                            f"Matrix A stream exceeded expected byte limit ({expected_a_bytes} bytes): "
+                            f"accumulated {running_a_bytes + chunk_len} bytes",
+                        )
+                    running_a_bytes += chunk_len
+                    a_byte_chunks.append(chunk_bytes)
+                else:
+                    if running_b_bytes + chunk_len > expected_b_bytes:
+                        self._abort(
+                            context,
+                            grpc.StatusCode.INVALID_ARGUMENT,
+                            f"Matrix B stream exceeded expected byte limit ({expected_b_bytes} bytes): "
+                            f"accumulated {running_b_bytes + chunk_len} bytes",
+                        )
+                    running_b_bytes += chunk_len
+                    b_byte_chunks.append(chunk_bytes)
+
+                expected_seq += 1
+                if chunk.is_final_chunk:
+                    final_seen = True
+                    break
+
+            if not final_seen:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "Stream terminated without final chunk flag")
+
+            # 4. Verify exact byte counts
+            if running_a_bytes != expected_a_bytes:
                 self._abort(
                     context,
                     grpc.StatusCode.INVALID_ARGUMENT,
-                    f"Out of order chunk: expected seq {expected_seq}, got {chunk.sequence_number}",
+                    f"Matrix A byte count mismatch: got {running_a_bytes}, expected {expected_a_bytes}",
                 )
 
-            if chunk.task_id != task_id:
+            if running_b_bytes != expected_b_bytes:
                 self._abort(
                     context,
                     grpc.StatusCode.INVALID_ARGUMENT,
-                    f"Chunk task_id mismatch: expected '{task_id}', got '{chunk.task_id}'",
+                    f"Matrix B byte count mismatch: got {running_b_bytes}, expected {expected_b_bytes}",
                 )
 
-            if chunk.is_matrix_a:
-                a_byte_chunks.append(chunk.chunk_bytes)
-            else:
-                b_byte_chunks.append(chunk.chunk_bytes)
+            # Reconstruct Tensors
+            a_bytes = b"".join(a_byte_chunks)
+            b_bytes = b"".join(b_byte_chunks)
 
-            expected_seq += 1
-            if chunk.is_final_chunk:
-                final_seen = True
-                break
+            matrix_a = np.frombuffer(a_bytes, dtype=np_dtype).reshape((m, k))
+            matrix_b = np.frombuffer(b_bytes, dtype=np_dtype).reshape((k, n))
 
-        if not final_seen:
-            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "Stream terminated without final chunk flag")
+            # 5. Execute GEMM
+            start_time = time.perf_counter()
+            matrix_c = self.engine.gemm(matrix_a, matrix_b, dtype=dtype)
+            exec_time_ms = int((time.perf_counter() - start_time) * 1000)
 
-        # 4. Reconstruct Tensors
-        a_bytes = b"".join(a_byte_chunks)
-        b_bytes = b"".join(b_byte_chunks)
+            # 6. Cryptographic digest and signing
+            c_bytes = matrix_c.tobytes()
+            c_hash = self.engine.compute_sha256(matrix_c)
 
-        np_dtype = np.float32 if dtype in ("fp32", "bf16") else np.float16
-        bytes_per_elem = 4 if np_dtype == np.float32 else 2
+            sig = ""
+            if self.signer is not None:
+                payload_to_sign = f"{task_id}:{c_hash}".encode("utf-8")
+                sig = self.signer.sign_message(payload_to_sign)
 
-        # Verify sizes match expected dimensions
-        expected_a_bytes = m * k * bytes_per_elem
-        expected_b_bytes = k * n * bytes_per_elem
-
-        if len(a_bytes) != expected_a_bytes:
-            self._abort(
-                context,
-                grpc.StatusCode.INVALID_ARGUMENT,
-                f"Matrix A byte count mismatch: got {len(a_bytes)}, expected {expected_a_bytes}",
+            return pb2.TileResult(
+                task_id=task_id,
+                rows=m,
+                cols=n,
+                result_bytes=c_bytes,
+                worker_signature=sig,
+                execution_time_ms=max(exec_time_ms, 1),
             )
-
-        if len(b_bytes) != expected_b_bytes:
-            self._abort(
-                context,
-                grpc.StatusCode.INVALID_ARGUMENT,
-                f"Matrix B byte count mismatch: got {len(b_bytes)}, expected {expected_b_bytes}",
-            )
-
-        matrix_a = np.frombuffer(a_bytes, dtype=np_dtype).reshape((m, k))
-        matrix_b = np.frombuffer(b_bytes, dtype=np_dtype).reshape((k, n))
-
-        # 5. Execute GEMM
-        start_time = time.perf_counter()
-        matrix_c = self.engine.gemm(matrix_a, matrix_b, dtype=dtype)
-        exec_time_ms = int((time.perf_counter() - start_time) * 1000)
-
-        # 6. Cryptographic digest and signing
-        c_bytes = matrix_c.tobytes()
-        c_hash = self.engine.compute_sha256(matrix_c)
-
-        sig = ""
-        if self.signer is not None:
-            payload_to_sign = f"{task_id}:{c_hash}".encode("utf-8")
-            sig = self.signer.sign_message(payload_to_sign)
-
-        return pb2.TileResult(
-            task_id=task_id,
-            rows=m,
-            cols=n,
-            result_bytes=c_bytes,
-            worker_signature=sig,
-            execution_time_ms=max(exec_time_ms, 1),
-        )
+        finally:
+            self._task_metadata.pop(task_id, None)

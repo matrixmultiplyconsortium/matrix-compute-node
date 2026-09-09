@@ -17,12 +17,14 @@ def mint_test_macaroon(
     expiry: int,
     max_gflops: float,
     locked_sats: int = 100,
+    payment_hash: str = "default_test_payment_hash",
 ) -> str:
     caveats = {
         "task_id": task_id,
         "expiry": expiry,
         "max_gflops": max_gflops,
         "locked_sats": locked_sats,
+        "payment_hash": payment_hash,
     }
     caveat_str = json.dumps(caveats, sort_keys=True)
     sig = hmac.new(key.encode("utf-8"), caveat_str.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -79,6 +81,7 @@ def test_gate_clears_valid_held_invoice(gate, mock_settlement, vkey):
         expiry=int(time.time()) + 3600,
         max_gflops=10.0,
         locked_sats=100,
+        payment_hash=payment_hash,
     )
     auth_header = f"L402 {macaroon}:{payment_hash}"
 
@@ -99,6 +102,7 @@ def test_gate_rejects_unpaid_invoice(gate, mock_settlement, vkey):
         expiry=int(time.time()) + 3600,
         max_gflops=10.0,
         locked_sats=100,
+        payment_hash=inv.payment_hash,
     )
     auth_header = f"L402 {macaroon}:{inv.payment_hash}"
 
@@ -118,6 +122,7 @@ def test_gate_rejects_invalid_signature(gate, mock_settlement, vkey):
         task_id=task_id,
         expiry=int(time.time()) + 3600,
         max_gflops=10.0,
+        payment_hash=inv.payment_hash,
     )
     auth_header = f"L402 {bad_macaroon}:{inv.payment_hash}"
 
@@ -135,6 +140,7 @@ def test_gate_rejects_mismatched_task_id(gate, mock_settlement, vkey):
         task_id="task_alpha",
         expiry=int(time.time()) + 3600,
         max_gflops=10.0,
+        payment_hash=inv.payment_hash,
     )
     auth_header = f"L402 {macaroon}:{inv.payment_hash}"
 
@@ -152,6 +158,7 @@ def test_gate_rejects_expired_macaroon(gate, mock_settlement, vkey):
         task_id="task_expired",
         expiry=int(time.time()) - 100,
         max_gflops=10.0,
+        payment_hash=inv.payment_hash,
     )
     auth_header = f"L402 {macaroon}:{inv.payment_hash}"
 
@@ -172,6 +179,7 @@ def test_gate_rejects_gflop_underpayment(gate, mock_settlement, vkey):
         expiry=int(time.time()) + 3600,
         max_gflops=0.001,
         locked_sats=100,
+        payment_hash=inv.payment_hash,
     )
     auth_header = f"L402 {macaroon}:{inv.payment_hash}"
 
