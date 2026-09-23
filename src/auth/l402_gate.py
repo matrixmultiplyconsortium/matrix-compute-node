@@ -42,6 +42,8 @@ class L402PreAllocationGate:
             return None, None
 
         cleaned = auth_header.strip()
+        if cleaned.lower().startswith("authorization:"):
+            cleaned = cleaned[14:].strip()
         parts = cleaned.split(" ", 1)
         if len(parts) != 2:
             return None, None
