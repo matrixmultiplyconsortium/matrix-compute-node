@@ -11,7 +11,7 @@ import json
 import secrets
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from matrix_contracts.schemas.settlement import (
     CreateHodlInvoiceRequest,
@@ -63,6 +63,8 @@ class InvoiceRecord:
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
     max_gflops: float = 100.0
+    task_ids: Optional[List[str]] = None
+    job_id: Optional[str] = None
 
 
 class MockSettlementService:
@@ -76,6 +78,7 @@ class MockSettlementService:
         self._lock = threading.Lock()
         self._invoices: Dict[str, InvoiceRecord] = {}       # payment_hash -> record
         self._task_index: Dict[str, str] = {}              # task_id -> payment_hash
+        self.query_count: int = 0
 
     def _mint_macaroon(
         self,
@@ -84,15 +87,22 @@ class MockSettlementService:
         expires_at: int,
         max_gflops: float,
         locked_sats: int = 100,
+        task_ids: Optional[List[str]] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """Mints an HMAC-SHA256 authenticated L402 Macaroon token."""
-        caveats = {
+        caveats: Dict[str, Any] = {
             "expiry": int(expires_at),
             "locked_sats": locked_sats,
             "max_gflops": float(max_gflops),
             "payment_hash": payment_hash,
             "task_id": task_id,
         }
+        if task_ids is not None:
+            caveats["task_ids"] = [str(t).strip() for t in task_ids if str(t).strip()]
+        if job_id is not None:
+            caveats["job_id"] = str(job_id).strip()
+
         caveat_str = json.dumps(caveats, sort_keys=True)
         sig = hmac.new(
             self.verification_key.encode("utf-8"),
@@ -112,7 +122,7 @@ class MockSettlementService:
         """
         Verifies an L402 Macaroon:
         1. Validates HMAC-SHA256 signature against verification key.
-        2. Asserts caveat task_id == expected_task_id.
+        2. Asserts caveat task containment (expected_task_id in task_ids or == task_id).
         3. Asserts caveat expiry > current_time.
         4. Asserts caveat max_gflops >= required_gflops.
         """
@@ -141,9 +151,24 @@ class MockSettlementService:
             if not hmac.compare_digest(signature, expected_sig):
                 return False, "Invalid macaroon HMAC signature"
 
-            # 2. Check task_id caveat
-            if caveats.get("task_id") != expected_task_id:
-                return False, f"Caveat task_id mismatch: {caveats.get('task_id')} != {expected_task_id}"
+            # 2. Check task_id containment
+            allowed_tasks: List[str] = []
+            caveat_tasks = caveats.get("task_ids") or caveats.get("task_batch") or caveats.get("tasks")
+            if caveat_tasks is not None:
+                if isinstance(caveat_tasks, list):
+                    allowed_tasks.extend(str(t).strip() for t in caveat_tasks if str(t).strip())
+                elif isinstance(caveat_tasks, str):
+                    allowed_tasks.extend(t.strip() for t in caveat_tasks.split(",") if t.strip())
+
+            caveat_task = caveats.get("task_id")
+            if caveat_task is not None:
+                clean_single = str(caveat_task).strip()
+                if clean_single and clean_single not in allowed_tasks:
+                    allowed_tasks.append(clean_single)
+
+            clean_expected = expected_task_id.strip()
+            if not any(hmac.compare_digest(clean_expected, allowed) for allowed in allowed_tasks):
+                return False, f"Caveat task_id mismatch: task '{expected_task_id}' not in authorized {allowed_tasks}"
 
             # 3. Check expiry caveat
             now = current_time if current_time is not None else time.time()
@@ -169,15 +194,25 @@ class MockSettlementService:
         payment_hash: Optional[str] = None,
         expiry_seconds: int = 3600,
         max_gflops: float = 100.0,
+        task_ids: Optional[List[str]] = None,
+        job_id: Optional[str] = None,
         **kwargs: Any,
     ) -> MockInvoiceResponse:
         """
         Creates a HODL invoice in UNPAID status.
-        Supports both Pydantic request object and direct keyword arguments.
+        Supports both Pydantic request object and direct keyword arguments,
+        with multi-task batch escrow support.
         """
+        resolved_task_ids: Optional[List[str]] = task_ids or kwargs.get("task_ids")
+        resolved_job_id: Optional[str] = job_id or kwargs.get("job_id")
+
         if isinstance(task_id_or_request, CreateHodlInvoiceRequest):
             req = task_id_or_request
-            task_id = req.task_id
+            task_id = req.task_id or ""
+            if resolved_task_ids is None and hasattr(req, "task_ids"):
+                resolved_task_ids = req.task_ids
+            if resolved_job_id is None and hasattr(req, "job_id"):
+                resolved_job_id = req.job_id
             compute_sats = req.total_compute_sats
             fee_pct = req.platform_fee_percent
             worker_ln = req.worker_lightning_address
@@ -188,6 +223,9 @@ class MockSettlementService:
             fee_pct = kwargs.get("platform_fee_percent", platform_fee_percent)
             worker_ln = kwargs.get("worker_lightning_address", worker_lightning_address)
             p_hash = payment_hash if payment_hash is not None else kwargs.get("payment_hash")
+
+        if not task_id and resolved_task_ids:
+            task_id = resolved_task_ids[0]
 
         # Resolve payment_hash & preimage
         if p_hash:
@@ -200,8 +238,12 @@ class MockSettlementService:
 
         with self._lock:
             # Reject duplicate task ID
-            if task_id in self._task_index:
+            if task_id and task_id in self._task_index:
                 raise ValueError(f"Task ID already registered: '{task_id}'")
+            if resolved_task_ids:
+                for tid in resolved_task_ids:
+                    if tid in self._task_index:
+                        raise ValueError(f"Task ID already registered: '{tid}'")
 
             # Reject duplicate payment hash
             if final_hash in self._invoices:
@@ -218,6 +260,8 @@ class MockSettlementService:
                 expires_at=expires_at,
                 max_gflops=max_gflops,
                 locked_sats=compute_sats,
+                task_ids=resolved_task_ids,
+                job_id=resolved_job_id,
             )
 
             payment_request = f"lnbc{compute_sats}000n1p{final_hash[:20]}mockhodl"
@@ -237,10 +281,16 @@ class MockSettlementService:
                 created_at=now,
                 expires_at=float(expires_at),
                 max_gflops=max_gflops,
+                task_ids=resolved_task_ids,
+                job_id=resolved_job_id,
             )
 
             self._invoices[final_hash] = record
-            self._task_index[task_id] = final_hash
+            if task_id:
+                self._task_index[task_id] = final_hash
+            if resolved_task_ids:
+                for tid in resolved_task_ids:
+                    self._task_index[tid] = final_hash
 
         return MockInvoiceResponse(
             payment_hash=final_hash,
@@ -277,6 +327,7 @@ class MockSettlementService:
         """Returns the current invoice status string ('UNPAID', 'HELD', 'SETTLED', 'CANCELLED')."""
         clean_hash = str(payment_hash).strip().lower()
         with self._lock:
+            self.query_count += 1
             record = self._invoices.get(clean_hash)
             return record.status.value if record else None
 
@@ -352,6 +403,7 @@ class MockSettlementService:
         with self._lock:
             self._invoices.clear()
             self._task_index.clear()
+            self.query_count = 0
 
     def clear(self) -> None:
         """Alias for reset."""

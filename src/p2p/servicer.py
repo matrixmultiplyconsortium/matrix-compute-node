@@ -168,11 +168,11 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         """
         Step 2: Strict Pre-Allocation Gate verification, stream ingestion, and GEMM execution.
         """
-        # 1. Extract Authorization header and metadata from invocation metadata
+        # 1. Extract Authorization header and metadata from invocation metadata (case-insensitive)
         auth_header = ""
         meta_task_id = None
         if context is not None:
-            metadata_dict = dict(context.invocation_metadata())
+            metadata_dict = {str(k).lower(): str(v) for k, v in context.invocation_metadata()}
             auth_header = metadata_dict.get("authorization") or metadata_dict.get("authorization-bin") or ""
             meta_task_id = metadata_dict.get("x-task-id")
 
@@ -185,7 +185,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         if not macaroon_b64 or not payment_hash:
             self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Malformed L402 Authorization header")
 
-        # Extract task_id from macaroon caveats if not in metadata
+        # Extract task_id from metadata or macaroon caveats
         task_id = meta_task_id
         if not task_id:
             try:
@@ -193,12 +193,22 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 import json
                 raw_bytes = base64.b64decode(macaroon_b64)
                 payload = json.loads(raw_bytes.decode("utf-8"))
-                task_id = payload.get("caveats", {}).get("task_id")
+                caveats = payload.get("caveats", {})
+                task_ids = caveats.get("task_ids") or caveats.get("task_batch") or caveats.get("tasks")
+                if task_ids and isinstance(task_ids, list):
+                    if len(task_ids) == 1:
+                        task_id = str(task_ids[0]).strip()
+                elif caveats.get("task_id"):
+                    task_id = str(caveats.get("task_id")).strip()
             except Exception:
                 pass
 
         if not task_id:
-            self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Unable to determine task_id from L402 token")
+            self._abort(
+                context,
+                grpc.StatusCode.UNAUTHENTICATED,
+                "Unable to determine task_id: batch macaroon requires explicit 'x-task-id' metadata",
+            )
 
         try:
             task_info = self._task_metadata.get(task_id)
@@ -209,7 +219,14 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
             dtype = task_info["dtype"] if task_info else "fp32"
 
             # Execute 5-step gate verification BEFORE allocating memory
-            ok, err_msg, err_code = self.gate.verify_token(auth_header, task_id, m=m, k=k, n=n)
+            ok, err_msg, err_code = self.gate.verify_token(
+                auth_header=auth_header,
+                task_id=task_id,
+                m=m,
+                k=k,
+                n=n,
+                x_task_id=meta_task_id,
+            )
             if not ok:
                 status = grpc.StatusCode.UNAUTHENTICATED
                 if err_code == "PERMISSION_DENIED":

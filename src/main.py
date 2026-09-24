@@ -55,6 +55,8 @@ class WorkerDaemon:
             verification_key=config.settlement_verification_key,
             min_price_rate=config.sats_per_gflop,
             min_task_sats=config.min_task_sats,
+            cache_ttl_seconds=getattr(config, "l402_cache_ttl_seconds", 300.0),
+            max_cache_size=getattr(config, "l402_max_cache_size", 10000),
         )
 
         # 4. Compute Engine

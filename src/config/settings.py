@@ -48,6 +48,12 @@ class NodeConfig(BaseModel):
     log_level: str = "INFO"
     grpc_max_workers: int = 10
     grpc_max_message_bytes: int = 100 * 1024 * 1024  # 100 MB
+    l402_cache_ttl_seconds: float = Field(
+        300.0, description="TTL in seconds for cached HELD invoice verifications in L402 gate"
+    )
+    l402_max_cache_size: int = Field(
+        10000, description="Maximum number of verified payment hashes to cache in L402 gate"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -75,6 +81,8 @@ class NodeConfig(BaseModel):
             "log_level": ["MATRIX_LOG_LEVEL", "LOG_LEVEL"],
             "grpc_max_workers": ["MATRIX_GRPC_MAX_WORKERS", "GRPC_MAX_WORKERS"],
             "grpc_max_message_bytes": ["MATRIX_GRPC_MAX_MESSAGE_BYTES", "GRPC_MAX_MESSAGE_BYTES"],
+            "l402_cache_ttl_seconds": ["MATRIX_L402_CACHE_TTL_SECONDS", "L402_CACHE_TTL_SECONDS"],
+            "l402_max_cache_size": ["MATRIX_L402_MAX_CACHE_SIZE", "L402_MAX_CACHE_SIZE"],
         }
 
         enriched = dict(data)
@@ -253,6 +261,16 @@ class NodeConfig(BaseModel):
         elif "LOG_LEVEL" in environ:
             data["log_level"] = environ["LOG_LEVEL"]
 
+        if "MATRIX_L402_CACHE_TTL_SECONDS" in environ:
+            data["l402_cache_ttl_seconds"] = float(environ["MATRIX_L402_CACHE_TTL_SECONDS"])
+        elif "L402_CACHE_TTL_SECONDS" in environ:
+            data["l402_cache_ttl_seconds"] = float(environ["L402_CACHE_TTL_SECONDS"])
+
+        if "MATRIX_L402_MAX_CACHE_SIZE" in environ:
+            data["l402_max_cache_size"] = int(environ["MATRIX_L402_MAX_CACHE_SIZE"])
+        elif "L402_MAX_CACHE_SIZE" in environ:
+            data["l402_max_cache_size"] = int(environ["L402_MAX_CACHE_SIZE"])
+
         return cls(**data)
 
     @classmethod
@@ -355,6 +373,20 @@ class NodeConfig(BaseModel):
             type=str,
             default=None,
             help="Logging verbosity level",
+        )
+        parser.add_argument(
+            "--l402-cache-ttl-seconds",
+            dest="l402_cache_ttl_seconds",
+            type=float,
+            default=None,
+            help="TTL in seconds for cached HELD invoice verifications in L402 gate",
+        )
+        parser.add_argument(
+            "--l402-max-cache-size",
+            dest="l402_max_cache_size",
+            type=int,
+            default=None,
+            help="Maximum number of verified payment hashes to cache in L402 gate",
         )
         return parser
 

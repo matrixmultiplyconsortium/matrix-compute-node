@@ -186,3 +186,153 @@ def test_execute_tile_task_full_lifecycle(servicer, mock_settlement, signer, vke
     c_hash = hashlib.sha256(result.result_bytes).hexdigest()
     expected_signed_msg = f"{task_id}:{c_hash}".encode("utf-8")
     assert signer.verify_signature(expected_signed_msg, result.worker_signature, signer.get_pubkey_hex()) is True
+
+
+def test_execute_tile_task_batch_caching(servicer, mock_settlement, signer, vkey):
+    task_1 = "batch_tile_1"
+    task_2 = "batch_tile_2"
+    m, k, n = 4, 4, 4
+
+    # 1. Negotiate both tasks
+    for tid in [task_1, task_2]:
+        req = pb2.TileTaskRequest(
+            task_id=tid,
+            matrix_a_rows=m,
+            matrix_a_cols=k,
+            matrix_b_cols=n,
+            dtype="fp32",
+        )
+        ack = servicer.RequestTileTask(req)
+        assert ack.is_ready is True
+
+    # 2. Create batch invoice covering both tasks
+    inv = mock_settlement.create_hodl_invoice(task_ids=[task_1, task_2], total_compute_sats=200)
+    mock_settlement.hold_invoice(inv.payment_hash)
+
+    # 3. Create batch Macaroon
+    caveats = {
+        "task_id": task_1,
+        "task_ids": [task_1, task_2],
+        "job_id": "job_servicer_batch",
+        "expiry": int(time.time()) + 3600,
+        "max_gflops": 10.0,
+        "locked_sats": 200,
+        "payment_hash": inv.payment_hash,
+    }
+    cav_str = json.dumps(caveats, sort_keys=True)
+    sig = hmac.new(vkey.encode("utf-8"), cav_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    mac = base64.b64encode(json.dumps({"caveats": caveats, "signature": sig}).encode("utf-8")).decode("utf-8")
+    auth_header = f"L402 {mac}:{inv.payment_hash}"
+
+    # Prepare data stream
+    a = np.ones((m, k), dtype=np.float32)
+    b = np.ones((k, n), dtype=np.float32)
+
+    # Execute tile 1 -> Cache miss, queries settlement
+    chunks_1 = [
+        pb2.TileDataChunk(task_id=task_1, chunk_bytes=a.tobytes(), is_matrix_a=True, sequence_number=0, is_final_chunk=False),
+        pb2.TileDataChunk(task_id=task_1, chunk_bytes=b.tobytes(), is_matrix_a=False, sequence_number=1, is_final_chunk=True),
+    ]
+    ctx_1 = MockGrpcContext(metadata=[("authorization", auth_header), ("x-task-id", task_1)])
+    res_1 = servicer.ExecuteTileTask(iter(chunks_1), context=ctx_1)
+    assert res_1.task_id == task_1
+    assert mock_settlement.query_count == 1
+    assert servicer.gate.remote_query_count == 1
+    assert servicer.gate.cache_hit_count == 0
+
+    # Execute tile 2 -> Cache hit, 0 new remote queries!
+    chunks_2 = [
+        pb2.TileDataChunk(task_id=task_2, chunk_bytes=a.tobytes(), is_matrix_a=True, sequence_number=0, is_final_chunk=False),
+        pb2.TileDataChunk(task_id=task_2, chunk_bytes=b.tobytes(), is_matrix_a=False, sequence_number=1, is_final_chunk=True),
+    ]
+    ctx_2 = MockGrpcContext(metadata=[("authorization", auth_header), ("x-task-id", task_2)])
+    res_2 = servicer.ExecuteTileTask(iter(chunks_2), context=ctx_2)
+    assert res_2.task_id == task_2
+    assert mock_settlement.query_count == 1
+    assert servicer.gate.remote_query_count == 1
+    assert servicer.gate.cache_hit_count == 1
+
+
+def test_execute_tile_task_unauthorized_task_aborts_permission_denied(servicer, mock_settlement, vkey):
+    task_auth = "batch_authorized_task"
+    task_unauth = "batch_unauthorized_task"
+    m, k, n = 4, 4, 4
+
+    req = pb2.TileTaskRequest(
+        task_id=task_unauth,
+        matrix_a_rows=m,
+        matrix_a_cols=k,
+        matrix_b_cols=n,
+        dtype="fp32",
+    )
+    servicer.RequestTileTask(req)
+
+    inv = mock_settlement.create_hodl_invoice(task_ids=[task_auth], total_compute_sats=100)
+    mock_settlement.hold_invoice(inv.payment_hash)
+
+    caveats = {
+        "task_id": task_auth,
+        "task_ids": [task_auth],
+        "job_id": "job_unauth_test",
+        "expiry": int(time.time()) + 3600,
+        "max_gflops": 10.0,
+        "locked_sats": 100,
+        "payment_hash": inv.payment_hash,
+    }
+    cav_str = json.dumps(caveats, sort_keys=True)
+    sig = hmac.new(vkey.encode("utf-8"), cav_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    mac = base64.b64encode(json.dumps({"caveats": caveats, "signature": sig}).encode("utf-8")).decode("utf-8")
+    auth_header = f"L402 {mac}:{inv.payment_hash}"
+
+    ctx = MockGrpcContext(metadata=[("authorization", auth_header), ("x-task-id", task_unauth)])
+
+    # Stream generator that records if any chunk was ingested
+    stream_read = False
+    def stream_gen():
+        nonlocal stream_read
+        stream_read = True
+        yield pb2.TileDataChunk(task_id=task_unauth)
+
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        servicer.ExecuteTileTask(stream_gen(), context=ctx)
+
+    # DoS protection check: abort occurs before any stream chunks are read
+    assert stream_read is False
+    assert mock_settlement.query_count == 0
+
+
+def test_execute_tile_task_case_insensitive_metadata(servicer, mock_settlement, vkey):
+    task_id = "task_case_insensitive"
+    m, k, n = 4, 4, 4
+
+    req = pb2.TileTaskRequest(
+        task_id=task_id,
+        matrix_a_rows=m,
+        matrix_a_cols=k,
+        matrix_b_cols=n,
+        dtype="fp32",
+    )
+    servicer.RequestTileTask(req)
+
+    inv = mock_settlement.create_hodl_invoice(task_id=task_id, total_compute_sats=100)
+    mock_settlement.hold_invoice(inv.payment_hash)
+
+    mac = mint_macaroon(vkey, task_id, int(time.time()) + 3600, 1.0, payment_hash=inv.payment_hash)
+    auth_header = f"L402 {mac}:{inv.payment_hash}"
+
+    a = np.ones((m, k), dtype=np.float32)
+    b = np.ones((k, n), dtype=np.float32)
+    chunks = [
+        pb2.TileDataChunk(task_id=task_id, chunk_bytes=a.tobytes(), is_matrix_a=True, sequence_number=0, is_final_chunk=False),
+        pb2.TileDataChunk(task_id=task_id, chunk_bytes=b.tobytes(), is_matrix_a=False, sequence_number=1, is_final_chunk=True),
+    ]
+
+    # Uppercase headers
+    ctx = MockGrpcContext(metadata=[
+        ("Authorization", auth_header),
+        ("X-Task-ID", task_id),
+    ])
+    result = servicer.ExecuteTileTask(iter(chunks), context=ctx)
+    assert result.task_id == task_id
+    assert len(result.result_bytes) == m * n * 4
+
