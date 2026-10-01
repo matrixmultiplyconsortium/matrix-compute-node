@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Set
 
 import grpc
 import numpy as np
@@ -15,6 +16,15 @@ from matrix_contracts.v1 import pb2, pb2_grpc
 from src.auth.l402_gate import L402PreAllocationGate
 from src.crypto.signer import WorkerSigner
 from src.engine.compute_core import ComputeEngine
+from src.engine.enclave_compute import (
+    EnclaveComputeCore,
+    EnclaveDecryptionError,
+    EnclaveExecutionError,
+    EnclaveFramingError,
+    EnclaveKeyExchangeError,
+    EnclaveSecurityPolicyError,
+)
+from src.attestation.base import BaseAttestationProvider
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +103,42 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         gate: Optional[L402PreAllocationGate] = None,
         engine: Optional[ComputeEngine] = None,
         config: Optional[Any] = None,
+        attestation_provider: Optional[BaseAttestationProvider] = None,
+        enclave_core: Optional[EnclaveComputeCore] = None,
     ) -> None:
         self.signer = signer
         self.gate = gate or L402PreAllocationGate()
         self.engine = engine or ComputeEngine()
         self.config = config
+        self.enclave_core = enclave_core or EnclaveComputeCore(
+            compute_engine=self.engine,
+            max_sessions=1000,
+            session_ttl_seconds=3600.0,
+        )
+
+        if attestation_provider is not None:
+            self.attestation_provider = attestation_provider
+        elif config is not None and getattr(config, "enable_confidential_compute", False):
+            prov_type = getattr(config, "attestation_provider", "auto")
+            if prov_type and prov_type.lower() != "none":
+                try:
+                    from src.attestation.base import get_attestation_provider
+                    self.attestation_provider = get_attestation_provider(
+                        provider_type=prov_type,
+                        device_index=getattr(config, "gpu_device_index", 0),
+                        fallback_to_simulated=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed initializing attestation provider from config: %s", exc)
+                    self.attestation_provider = None
+            else:
+                self.attestation_provider = None
+        else:
+            self.attestation_provider = None
+
         self._lock = threading.Lock()
         self._task_metadata = TaskMetadataStore(max_size=1000, ttl_seconds=3600.0)
+        self._active_tasks: Set[str] = set()
 
     def RequestTileTask(
         self,
@@ -107,33 +146,139 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         context: Optional[grpc.ServicerContext] = None,
     ) -> pb2.TileTaskAck:
         """
-        Step 1: Handshake, parameter validation, and theoretical GFLOP estimation.
+        Step 1: Handshake, parameter validation, theoretical GFLOP estimation,
+        and Confidential Computing attestation evidence generation.
         """
-        if request.matrix_a_rows <= 0 or request.matrix_a_cols <= 0 or request.matrix_b_cols <= 0:
-            if context is not None:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Matrix dimensions must be positive integers")
-            raise ValueError("Matrix dimensions must be positive integers")
+        with self._lock:
+            if request.task_id in self._active_tasks:
+                self._abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"Task '{request.task_id}' is currently in active streaming execution",
+                )
 
-        dtype = (request.dtype or "fp32").lower().strip()
-        if dtype not in ("fp32", "fp16", "bf16"):
-            if context is not None:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Unsupported dtype: {dtype}")
-            raise ValueError(f"Unsupported dtype: {dtype}")
+        if request.matrix_a_rows <= 0 or request.matrix_a_cols <= 0 or request.matrix_b_cols <= 0:
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "Matrix dimensions must be positive integers")
 
         m = int(request.matrix_a_rows)
         k = int(request.matrix_a_cols)
         n = int(request.matrix_b_cols)
+
+        max_elem_limit = 64 * 1024 * 1024
+        if (m * n) > max_elem_limit or max(m, n) > 16384:
+            self._abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Tile dimensions ({m}x{k} @ {k}x{n}) exceed maximum allowed allocation limits (max_elem={max_elem_limit}, max_dim=16384)",
+            )
+
+        dtype = (request.dtype or "fp32").lower().strip()
+        if dtype not in ("fp32", "fp16", "bf16"):
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, f"Unsupported dtype: {dtype}")
+
         estimated_gflops = (2.0 * float(m) * float(k) * float(n)) / 1e9
 
+        worker_ephemeral_pubkey = b""
+        attestation_evidence_bytes = b""
+        tee_type = ""
+        worker_ephemeral_priv = None
+
+        if request.require_confidential_compute:
+            if self.attestation_provider is None or not self.attestation_provider.is_available():
+                if context is not None:
+                    context.abort(
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "Confidential computing requested but worker has no operational attestation provider",
+                    )
+                raise RuntimeError(
+                    "Confidential computing requested but worker has no operational attestation provider"
+                )
+
+            req_tee = request.required_tee_type.strip() if request.required_tee_type else ""
+            if req_tee and req_tee not in (self.attestation_provider.provider_name, "any"):
+                if context is not None:
+                    context.abort(
+                        grpc.StatusCode.UNIMPLEMENTED,
+                        f"Worker TEE type '{self.attestation_provider.provider_name}' does not match requested '{req_tee}'",
+                    )
+                raise ValueError(
+                    f"Worker TEE type '{self.attestation_provider.provider_name}' does not match requested '{req_tee}'"
+                )
+
+            if not request.client_ephemeral_pubkey or len(request.client_ephemeral_pubkey) != 32:
+                if context is not None:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "client_ephemeral_pubkey must be exactly 32 bytes")
+                raise ValueError("client_ephemeral_pubkey must be exactly 32 bytes")
+
+            if not request.attestation_nonce or len(request.attestation_nonce) != 32:
+                if context is not None:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "attestation_nonce must be exactly 32 bytes")
+                raise ValueError("attestation_nonce must be exactly 32 bytes")
+
+            # Generate worker ephemeral X25519 keypair
+            from cryptography.hazmat.primitives.asymmetric import x25519
+            from cryptography.hazmat.primitives import serialization
+
+            worker_ephemeral_priv = x25519.X25519PrivateKey.generate()
+            worker_ephemeral_pub = worker_ephemeral_priv.public_key()
+            worker_ephemeral_pubkey = worker_ephemeral_pub.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+
+            # Generate hardware attestation evidence bound to challenger nonce and worker ephemeral pubkey
+            evidence = self.attestation_provider.generate_evidence(
+                nonce=request.attestation_nonce,
+                public_key=worker_ephemeral_pubkey,
+            )
+            attestation_evidence_bytes = evidence.to_bytes()
+            tee_type = self.attestation_provider.provider_name
+
         with self._lock:
-            self._task_metadata[request.task_id] = {
+            meta: Dict[str, Any] = {
                 "m": m,
                 "k": k,
                 "n": n,
                 "dtype": dtype,
                 "gflops": estimated_gflops,
                 "created_at": time.time(),
+                "is_confidential": bool(request.require_confidential_compute),
             }
+            if request.require_confidential_compute:
+                meta.update({
+                    "worker_ephemeral_priv": worker_ephemeral_priv,
+                    "worker_ephemeral_pubkey": worker_ephemeral_pubkey,
+                    "client_ephemeral_pubkey": request.client_ephemeral_pubkey,
+                    "attestation_nonce": request.attestation_nonce,
+                })
+                try:
+                    self.enclave_core.create_session(
+                        task_id=request.task_id,
+                        m=m,
+                        k=k,
+                        n=n,
+                        dtype=dtype,
+                        require_confidential=True,
+                        client_ephemeral_pubkey=request.client_ephemeral_pubkey,
+                        attestation_nonce=request.attestation_nonce,
+                        worker_ephemeral_priv=worker_ephemeral_priv,
+                    )
+                except EnclaveKeyExchangeError as exc:
+                    self._abort(
+                        context,
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"Enclave key exchange failed: {exc}",
+                    )
+            else:
+                self.enclave_core.create_session(
+                    task_id=request.task_id,
+                    m=m,
+                    k=k,
+                    n=n,
+                    dtype=dtype,
+                    require_confidential=False,
+                )
+            self._task_metadata[request.task_id] = meta
 
         worker_pubkey = self.signer.get_pubkey_hex() if self.signer is not None else ""
 
@@ -143,6 +288,9 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
             estimated_gflops=estimated_gflops,
             worker_pubkey=worker_pubkey,
             message="Node ready",
+            worker_ephemeral_pubkey=worker_ephemeral_pubkey,
+            attestation_evidence=attestation_evidence_bytes,
+            tee_type=tee_type,
         )
 
     def _abort(self, context: Optional[grpc.ServicerContext], status_code: grpc.StatusCode, details: str) -> None:
@@ -210,6 +358,15 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 "Unable to determine task_id: batch macaroon requires explicit 'x-task-id' metadata",
             )
 
+        with self._lock:
+            if task_id in self._active_tasks:
+                self._abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"Task '{task_id}' is already actively executing",
+                )
+            self._active_tasks.add(task_id)
+
         try:
             task_info = self._task_metadata.get(task_id)
 
@@ -242,98 +399,39 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                     f"Task '{task_id}' was not negotiated via RequestTileTask",
                 )
 
-            np_dtype = np.float32 if dtype in ("fp32", "bf16") else np.float16
-            bytes_per_elem = 4 if np_dtype == np.float32 else 2
+            session = self.enclave_core.get_session(task_id)
+            if session is None:
+                session, _ = self.enclave_core.create_session(
+                    task_id=task_id,
+                    m=m,
+                    k=k,
+                    n=n,
+                    dtype=dtype,
+                    require_confidential=task_info.get("is_confidential", False),
+                    client_ephemeral_pubkey=task_info.get("client_ephemeral_pubkey"),
+                    attestation_nonce=task_info.get("attestation_nonce"),
+                    worker_ephemeral_priv=task_info.get("worker_ephemeral_priv"),
+                )
 
-            expected_a_bytes = m * k * bytes_per_elem
-            expected_b_bytes = k * n * bytes_per_elem
-
-            # 3. Stream Ingestion & Chunk Assembly (with strict running byte bounds)
-            a_byte_chunks = []
-            b_byte_chunks = []
-            running_a_bytes = 0
-            running_b_bytes = 0
-            expected_seq = 0
-            final_seen = False
-
+            # Ingest and decrypt stream chunks inside enclave execution boundary
             for chunk in request_iterator:
-                if chunk.sequence_number != expected_seq:
-                    self._abort(
-                        context,
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        f"Out of order chunk: expected seq {expected_seq}, got {chunk.sequence_number}",
-                    )
+                try:
+                    session.ingest_chunk(chunk)
+                except EnclaveSecurityPolicyError as exc:
+                    self._abort(context, grpc.StatusCode.PERMISSION_DENIED, str(exc))
+                except (EnclaveDecryptionError, EnclaveFramingError) as exc:
+                    self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
-                if chunk.task_id != task_id:
-                    self._abort(
-                        context,
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        f"Chunk task_id mismatch: expected '{task_id}', got '{chunk.task_id}'",
-                    )
+            # Finalize and execute in-enclave GEMM, encrypt output
+            try:
+                result_bytes, iv, tag, is_encrypted, exec_time_ms = session.execute_and_encrypt()
+            except EnclaveExecutionError as exc:
+                self._abort(context, grpc.StatusCode.INTERNAL, str(exc))
+            except EnclaveFramingError as exc:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
-                chunk_bytes = chunk.chunk_bytes if chunk.chunk_bytes is not None else b""
-                chunk_len = len(chunk_bytes)
-
-                if chunk.is_matrix_a:
-                    if running_a_bytes + chunk_len > expected_a_bytes:
-                        self._abort(
-                            context,
-                            grpc.StatusCode.INVALID_ARGUMENT,
-                            f"Matrix A stream exceeded expected byte limit ({expected_a_bytes} bytes): "
-                            f"accumulated {running_a_bytes + chunk_len} bytes",
-                        )
-                    running_a_bytes += chunk_len
-                    a_byte_chunks.append(chunk_bytes)
-                else:
-                    if running_b_bytes + chunk_len > expected_b_bytes:
-                        self._abort(
-                            context,
-                            grpc.StatusCode.INVALID_ARGUMENT,
-                            f"Matrix B stream exceeded expected byte limit ({expected_b_bytes} bytes): "
-                            f"accumulated {running_b_bytes + chunk_len} bytes",
-                        )
-                    running_b_bytes += chunk_len
-                    b_byte_chunks.append(chunk_bytes)
-
-                expected_seq += 1
-                if chunk.is_final_chunk:
-                    final_seen = True
-                    break
-
-            if not final_seen:
-                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "Stream terminated without final chunk flag")
-
-            # 4. Verify exact byte counts
-            if running_a_bytes != expected_a_bytes:
-                self._abort(
-                    context,
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    f"Matrix A byte count mismatch: got {running_a_bytes}, expected {expected_a_bytes}",
-                )
-
-            if running_b_bytes != expected_b_bytes:
-                self._abort(
-                    context,
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    f"Matrix B byte count mismatch: got {running_b_bytes}, expected {expected_b_bytes}",
-                )
-
-            # Reconstruct Tensors
-            a_bytes = b"".join(a_byte_chunks)
-            b_bytes = b"".join(b_byte_chunks)
-
-            matrix_a = np.frombuffer(a_bytes, dtype=np_dtype).reshape((m, k))
-            matrix_b = np.frombuffer(b_bytes, dtype=np_dtype).reshape((k, n))
-
-            # 5. Execute GEMM
-            start_time = time.perf_counter()
-            matrix_c = self.engine.gemm(matrix_a, matrix_b, dtype=dtype)
-            exec_time_ms = int((time.perf_counter() - start_time) * 1000)
-
-            # 6. Cryptographic digest and signing
-            c_bytes = matrix_c.tobytes()
-            c_hash = self.engine.compute_sha256(matrix_c)
-
+            # Cryptographic digest and signing
+            c_hash = hashlib.sha256(result_bytes).hexdigest()
             sig = ""
             if self.signer is not None:
                 payload_to_sign = f"{task_id}:{c_hash}".encode("utf-8")
@@ -341,11 +439,17 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
 
             return pb2.TileResult(
                 task_id=task_id,
-                rows=m,
-                cols=n,
-                result_bytes=c_bytes,
+                rows=session.m,
+                cols=session.n,
+                result_bytes=result_bytes,
                 worker_signature=sig,
                 execution_time_ms=max(exec_time_ms, 1),
+                is_encrypted=is_encrypted,
+                iv=iv,
+                tag=tag,
             )
         finally:
+            with self._lock:
+                self._active_tasks.discard(task_id)
+            self.enclave_core.close_session(task_id)
             self._task_metadata.pop(task_id, None)

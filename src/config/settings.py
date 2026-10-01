@@ -54,6 +54,13 @@ class NodeConfig(BaseModel):
     l402_max_cache_size: int = Field(
         10000, description="Maximum number of verified payment hashes to cache in L402 gate"
     )
+    enable_confidential_compute: bool = Field(
+        True, description="Enable TEE Confidential Computing"
+    )
+    attestation_provider: str = Field(
+        "auto",
+        description="Attestation provider: 'auto', 'nvidia-cca', 'simulated-cca', 'none'",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -83,6 +90,8 @@ class NodeConfig(BaseModel):
             "grpc_max_message_bytes": ["MATRIX_GRPC_MAX_MESSAGE_BYTES", "GRPC_MAX_MESSAGE_BYTES"],
             "l402_cache_ttl_seconds": ["MATRIX_L402_CACHE_TTL_SECONDS", "L402_CACHE_TTL_SECONDS"],
             "l402_max_cache_size": ["MATRIX_L402_MAX_CACHE_SIZE", "L402_MAX_CACHE_SIZE"],
+            "enable_confidential_compute": ["MATRIX_ENABLE_CONFIDENTIAL_COMPUTE", "ENABLE_CONFIDENTIAL_COMPUTE"],
+            "attestation_provider": ["MATRIX_ATTESTATION_PROVIDER", "ATTESTATION_PROVIDER"],
         }
 
         enriched = dict(data)
@@ -104,6 +113,9 @@ class NodeConfig(BaseModel):
                     enriched["nostr_relays"] = [r.strip() for r in raw[1:-1].split(",") if r.strip()]
             else:
                 enriched["nostr_relays"] = [r.strip() for r in raw.split(",") if r.strip()]
+
+        if "enable_confidential_compute" in enriched and isinstance(enriched["enable_confidential_compute"], str):
+            enriched["enable_confidential_compute"] = enriched["enable_confidential_compute"].strip().lower() in ("1", "true", "yes")
 
         return enriched
 
@@ -271,6 +283,16 @@ class NodeConfig(BaseModel):
         elif "L402_MAX_CACHE_SIZE" in environ:
             data["l402_max_cache_size"] = int(environ["L402_MAX_CACHE_SIZE"])
 
+        if "MATRIX_ENABLE_CONFIDENTIAL_COMPUTE" in environ:
+            data["enable_confidential_compute"] = environ["MATRIX_ENABLE_CONFIDENTIAL_COMPUTE"].strip().lower() in ("1", "true", "yes")
+        elif "ENABLE_CONFIDENTIAL_COMPUTE" in environ:
+            data["enable_confidential_compute"] = environ["ENABLE_CONFIDENTIAL_COMPUTE"].strip().lower() in ("1", "true", "yes")
+
+        if "MATRIX_ATTESTATION_PROVIDER" in environ:
+            data["attestation_provider"] = environ["MATRIX_ATTESTATION_PROVIDER"].strip()
+        elif "ATTESTATION_PROVIDER" in environ:
+            data["attestation_provider"] = environ["ATTESTATION_PROVIDER"].strip()
+
         return cls(**data)
 
     @classmethod
@@ -387,6 +409,20 @@ class NodeConfig(BaseModel):
             type=int,
             default=None,
             help="Maximum number of verified payment hashes to cache in L402 gate",
+        )
+        parser.add_argument(
+            "--enable-confidential-compute",
+            dest="enable_confidential_compute",
+            action=argparse.BooleanOptionalAction if hasattr(argparse, "BooleanOptionalAction") else "store_true",
+            default=None,
+            help="Enable TEE Confidential Computing",
+        )
+        parser.add_argument(
+            "--attestation-provider",
+            dest="attestation_provider",
+            type=str,
+            default=None,
+            help="Attestation provider ('auto', 'nvidia-cca', 'simulated-cca', 'none')",
         )
         return parser
 
