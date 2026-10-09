@@ -120,6 +120,136 @@ class ComputeEngine:
 
         return c_f64.astype(np.float32)
 
+    def gemv(self, a: np.ndarray, v: np.ndarray, dtype: str = "fp32") -> np.ndarray:
+        """
+        Calculates matrix-vector product v_next = A x v for the specified precision datatype.
+        Supports 1D vector v of shape (K,) and 2D column vector v of shape (K, 1).
+        Always returns 1D array of shape (M,).
+
+        Supported dtypes: 'fp32', 'fp16', 'bf16'.
+        """
+        if not isinstance(a, np.ndarray):
+            a = np.asarray(a)
+        if not isinstance(v, np.ndarray):
+            v = np.asarray(v)
+
+        if a.ndim != 2:
+            raise ValueError(f"Matrix A must be 2-dimensional. Got shape {a.shape}")
+
+        if v.ndim == 1:
+            if v.shape[0] != a.shape[1]:
+                raise ValueError(
+                    f"Inner dimension mismatch: A columns ({a.shape[1]}) != V elements ({v.shape[0]})"
+                )
+            v_1d = np.ascontiguousarray(v)
+        elif v.ndim == 2:
+            if v.shape[1] != 1:
+                raise ValueError(
+                    f"Vector V must be 1D or 2D column vector (shape (K,) or (K, 1)). Got shape {v.shape}"
+                )
+            if v.shape[0] != a.shape[1]:
+                raise ValueError(
+                    f"Inner dimension mismatch: A columns ({a.shape[1]}) != V rows ({v.shape[0]})"
+                )
+            v_1d = np.ascontiguousarray(v.reshape(-1))
+        else:
+            raise ValueError(
+                f"Vector V must be 1D or 2D column vector (shape (K,) or (K, 1)). Got shape {v.shape}"
+            )
+
+        norm_dtype = dtype.lower().strip()
+        if norm_dtype in ("float32", "fp32"):
+            norm_dtype = "fp32"
+        elif norm_dtype in ("float16", "fp16"):
+            norm_dtype = "fp16"
+        elif norm_dtype in ("bfloat16", "bf16"):
+            norm_dtype = "bf16"
+        else:
+            raise ValueError(f"Unsupported dtype '{dtype}'. Supported: 'fp32', 'fp16', 'bf16'")
+
+        # Backend: PyTorch CUDA
+        if self.backend == "torch_cuda" and _TORCH_AVAILABLE:
+            try:
+                torch_dtype = torch.float32
+                if norm_dtype == "fp16":
+                    torch_dtype = torch.float16
+                elif norm_dtype == "bf16":
+                    torch_dtype = torch.bfloat16
+
+                t_a = torch.from_numpy(np.ascontiguousarray(a)).to(device="cuda", dtype=torch_dtype)
+                t_v = torch.from_numpy(v_1d).to(device="cuda", dtype=torch_dtype)
+                t_res = torch.mv(t_a, t_v)
+
+                if norm_dtype == "bf16":
+                    res_np = t_res.to(torch.float32).cpu().numpy()
+                    return ComputeEngine.truncate_to_bf16(res_np).reshape(-1)
+
+                res_np = t_res.cpu().numpy()
+                if norm_dtype == "fp16":
+                    return res_np.astype(np.float16).reshape(-1)
+                return res_np.astype(np.float32).reshape(-1)
+            except Exception as ex:
+                logger.warning(f"CUDA PyTorch GEMV failed, falling back to NumPy: {ex}")
+
+        # Backend: CuPy
+        if self.backend == "cupy" and _CUPY_AVAILABLE:
+            try:
+                cp_a = cupy.asarray(a)
+                cp_v = cupy.asarray(v_1d)
+                if norm_dtype == "bf16":
+                    cp_a = cupy.asarray(ComputeEngine.truncate_to_bf16(a), dtype=cupy.float32)
+                    cp_v = cupy.asarray(ComputeEngine.truncate_to_bf16(v_1d), dtype=cupy.float32)
+                    cp_res = cupy.matmul(cp_a, cp_v)
+                    return ComputeEngine.truncate_to_bf16(cupy.asnumpy(cp_res)).reshape(-1)
+                elif norm_dtype == "fp16":
+                    cp_res = cupy.matmul(cp_a.astype(cupy.float16), cp_v.astype(cupy.float16))
+                    return cupy.asnumpy(cp_res).astype(np.float16).reshape(-1)
+                else:
+                    cp_res = cupy.matmul(cp_a.astype(cupy.float32), cp_v.astype(cupy.float32))
+                    return cupy.asnumpy(cp_res).astype(np.float32).reshape(-1)
+            except Exception as ex:
+                logger.warning(f"CuPy GEMV failed, falling back to NumPy: {ex}")
+
+        # Backend: PyTorch CPU
+        if self.backend == "torch_cpu" and _TORCH_AVAILABLE:
+            try:
+                torch_dtype = torch.float32
+                if norm_dtype == "fp16":
+                    torch_dtype = torch.float16
+                elif norm_dtype == "bf16":
+                    torch_dtype = torch.bfloat16
+
+                t_a = torch.from_numpy(np.ascontiguousarray(a)).to(dtype=torch_dtype)
+                t_v = torch.from_numpy(v_1d).to(dtype=torch_dtype)
+                t_res = torch.mv(t_a, t_v)
+
+                if norm_dtype == "bf16":
+                    return ComputeEngine.truncate_to_bf16(t_res.to(torch.float32).numpy()).reshape(-1)
+                res_np = t_res.numpy()
+                if norm_dtype == "fp16":
+                    return res_np.astype(np.float16).reshape(-1)
+                return res_np.astype(np.float32).reshape(-1)
+            except Exception as ex:
+                logger.warning(f"PyTorch CPU GEMV failed, falling back to NumPy: {ex}")
+
+        # Backend: NumPy CPU Fallback
+        if norm_dtype == "bf16":
+            a_bf16 = ComputeEngine.truncate_to_bf16(a)
+            v_bf16 = ComputeEngine.truncate_to_bf16(v_1d)
+            res = np.matmul(a_bf16.astype(np.float64), v_bf16.astype(np.float64)).astype(np.float32)
+            return ComputeEngine.truncate_to_bf16(res).reshape(-1)
+
+        a_f64 = a.astype(np.float64)
+        v_f64 = v_1d.astype(np.float64)
+        res_f64 = np.matmul(a_f64, v_f64)
+
+        if norm_dtype == "fp32":
+            return res_f64.astype(np.float32).reshape(-1)
+        elif norm_dtype == "fp16":
+            return res_f64.astype(np.float16).reshape(-1)
+
+        return res_f64.astype(np.float32).reshape(-1)
+
     @staticmethod
     def truncate_to_bf16(tensor: np.ndarray) -> np.ndarray:
         """
@@ -168,6 +298,15 @@ class ComputeEngine:
         ku = float(k) * u
         gamma_k = (ku / (1.0 - ku)) if ku < 0.999 else (ku * 1000.0)
         return gamma_k * float(norm_a) * float(norm_b)
+
+    @staticmethod
+    def higham_vector_bound(k: int, norm_a: float, norm_v: float, dtype: str = "fp32") -> float:
+        """
+        Higham's matrix-vector rounding bound:
+        gamma_K = (K * u) / (1 - K * u)
+        bound = gamma_K * ||A||_inf * ||v||_inf
+        """
+        return ComputeEngine.higham_matrix_bound(k, norm_a, norm_v, dtype=dtype)
 
     @staticmethod
     def compute_sha256(tensor: np.ndarray) -> str:

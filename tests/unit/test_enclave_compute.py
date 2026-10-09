@@ -471,7 +471,8 @@ def test_enclave_compute_core_eviction():
     assert core.get_session("task-3") is not None
 
     # Test TTL expiration
-    core.evict_expired(now=session_start := 1000000000.0 + 10.0)
+    session_start = 1000000000.0 + 10.0
+    core.evict_expired(now=session_start)
     assert core.get_session("task-2") is None
     assert core.get_session("task-3") is None
 

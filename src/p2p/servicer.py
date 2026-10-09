@@ -23,7 +23,11 @@ from src.engine.enclave_compute import (
     EnclaveFramingError,
     EnclaveKeyExchangeError,
     EnclaveSecurityPolicyError,
+    aes_gcm_decrypt,
+    aes_gcm_encrypt,
+    derive_session_keys,
 )
+from src.engine.session_manager import SessionExpiredError, SessionManager
 from src.attestation.base import BaseAttestationProvider
 
 logger = logging.getLogger(__name__)
@@ -95,6 +99,9 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
     1. RequestTileTask: Handshake, parameter validation, GFLOP quotation, and readiness.
     2. ExecuteTileTask: Strict pre-allocation L402 verification, streaming chunk ingestion,
        GEMM calculation, SHA256 hashing, and worker cryptographic signing.
+    3. LeaseMatrix: Pins matrix A in VRAM/memory across iterative steps.
+    4. StepIterative: Fast iterative GEMV matrix-vector steps (v_{t+1} = A * v_t).
+    5. ReleaseLease: Explicit zeroization and VRAM deallocation.
     """
 
     def __init__(
@@ -105,6 +112,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         config: Optional[Any] = None,
         attestation_provider: Optional[BaseAttestationProvider] = None,
         enclave_core: Optional[EnclaveComputeCore] = None,
+        session_manager: Optional[SessionManager] = None,
     ) -> None:
         self.signer = signer
         self.gate = gate or L402PreAllocationGate()
@@ -114,6 +122,12 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
             compute_engine=self.engine,
             max_sessions=1000,
             session_ttl_seconds=3600.0,
+        )
+        self.session_manager = session_manager or SessionManager(
+            max_sessions=getattr(config, "max_sessions", 100) if config else 100,
+            max_memory_bytes=getattr(config, "max_memory_bytes", 4 * 1024 * 1024 * 1024) if config else 4 * 1024 * 1024 * 1024,
+            default_ttl_seconds=getattr(config, "lease_default_ttl_seconds", 3600.0) if config else 3600.0,
+            compute_engine=self.engine,
         )
 
         if attestation_provider is not None:
@@ -453,3 +467,367 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 self._active_tasks.discard(task_id)
             self.enclave_core.close_session(task_id)
             self._task_metadata.pop(task_id, None)
+
+    def LeaseMatrix(
+        self,
+        request: pb2.LeaseMatrixRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.LeaseMatrixResponse:
+        """
+        Allocates and pins matrix A in memory across multiple vector steps.
+        Enforces upfront L402 verification, dimension bounding, and optional X25519 key exchange.
+        """
+        # 1. Parameter Validation
+        lease_id = str(request.lease_id).strip()
+        if not lease_id:
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "lease_id must not be empty")
+
+        rows = int(request.rows)
+        cols = int(request.cols)
+        if rows <= 0 or cols <= 0:
+            self._abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Matrix dimensions must be positive integers, got ({rows}, {cols})",
+            )
+
+        max_elem_limit = 64 * 1024 * 1024
+        if (rows * cols) > max_elem_limit or max(rows, cols) > 16384:
+            self._abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Matrix dimensions ({rows}x{cols}) exceed maximum limits (max_elem={max_elem_limit}, max_dim=16384)",
+            )
+
+        dtype = (request.dtype or "fp32").lower().strip()
+        if dtype not in ("fp32", "fp16", "bf16"):
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, f"Unsupported dtype: {dtype}")
+
+        ttl_seconds = int(request.ttl_seconds) if request.ttl_seconds > 0 else 3600
+        ttl_seconds = min(ttl_seconds, 86400)  # Maximum 24h
+
+        # 2. Extract Authorization metadata & Perform Upfront L402 Gate Verification
+        auth_header = ""
+        meta_lease_id = None
+        if context is not None:
+            metadata_dict = {str(k).lower(): str(v) for k, v in context.invocation_metadata()}
+            auth_header = metadata_dict.get("authorization") or metadata_dict.get("authorization-bin") or ""
+            meta_lease_id = metadata_dict.get("x-lease-id") or metadata_dict.get("x-task-id")
+
+            if self.gate is not None:
+                if not auth_header:
+                    self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Missing Authorization header with L402 token")
+
+                macaroon_b64, payment_hash = self.gate.parse_auth_header(auth_header)
+                if not macaroon_b64 or not payment_hash:
+                    self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Malformed L402 Authorization header")
+
+                # Upfront gate verification: baseline GFLOPs for A (M x K x 1)
+                ok, err_msg, err_code = self.gate.verify_token(
+                    auth_header=auth_header,
+                    task_id=lease_id,
+                    m=rows,
+                    k=cols,
+                    n=1,
+                    x_task_id=meta_lease_id or lease_id,
+                )
+                if not ok:
+                    status = grpc.StatusCode.UNAUTHENTICATED
+                    if err_code == "PERMISSION_DENIED":
+                        status = grpc.StatusCode.PERMISSION_DENIED
+                    elif err_code == "FAILED_PRECONDITION":
+                        status = grpc.StatusCode.FAILED_PRECONDITION
+                    self._abort(context, status, err_msg or "L402 Pre-allocation check failed")
+
+        # 3. Confidential Computing Handshake (X25519 ECDH)
+        worker_ephemeral_pubkey = b""
+        session_keys = None
+
+        if request.require_confidential_compute:
+            if not request.client_ephemeral_pubkey or len(request.client_ephemeral_pubkey) != 32:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "client_ephemeral_pubkey must be exactly 32 bytes")
+
+            from cryptography.hazmat.primitives.asymmetric import x25519
+            from cryptography.hazmat.primitives import serialization
+
+            try:
+                worker_ephemeral_priv = x25519.X25519PrivateKey.generate()
+                worker_ephemeral_pub = worker_ephemeral_priv.public_key()
+                worker_ephemeral_pubkey = worker_ephemeral_pub.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+
+                # Derive directional keys K_c2w, K_w2c using HKDF-SHA256
+                salt = hashlib.sha256(f"iterative:{lease_id}".encode("utf-8")).digest()
+                session_keys = derive_session_keys(
+                    worker_priv=worker_ephemeral_priv,
+                    client_pub_bytes=request.client_ephemeral_pubkey,
+                    client_nonce=salt,
+                )
+            except Exception as exc:
+                self._abort(context, grpc.StatusCode.INTERNAL, f"ECDH key exchange failed: {exc}")
+
+        # 4. Matrix Deserialization & Payload Validation
+        item_size = 4 if dtype in ("fp32", "bf16") else 2
+        expected_raw_bytes = rows * cols * item_size
+
+        matrix_bytes = request.matrix_bytes
+        if request.require_confidential_compute:
+            if len(matrix_bytes) != expected_raw_bytes + 28:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "Confidential compute requires 28-byte encrypted framing (IV + ciphertext + tag)",
+                )
+            # Wire encrypted matrix: [IV (12B) || Tag (16B) || Ciphertext]
+            iv = matrix_bytes[:12]
+            tag = matrix_bytes[12:28]
+            ct = matrix_bytes[28:]
+            try:
+                matrix_bytes = aes_gcm_decrypt(
+                    key=session_keys.k_c2w,
+                    iv=iv,
+                    ciphertext=ct,
+                    tag=tag,
+                    aad=None,
+                    fallback_aads=[f"{lease_id}:matrix".encode("utf-8"), b""],
+                )
+            except Exception as exc:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, f"Matrix decryption failed: {exc}")
+
+        if len(matrix_bytes) != expected_raw_bytes:
+            # Support 16-bit BF16 wire transfer if 2 bytes per element
+            if dtype == "bf16" and len(matrix_bytes) == rows * cols * 2:
+                raw_u16 = np.frombuffer(matrix_bytes, dtype=np.uint16)
+                raw_u32 = raw_u16.astype(np.uint32) << 16
+                matrix_arr = raw_u32.view(np.float32).reshape((rows, cols))
+            else:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"Payload size mismatch: expected {expected_raw_bytes} bytes for {rows}x{cols} {dtype}, got {len(matrix_bytes)} bytes",
+                )
+        else:
+            np_dt = np.float32 if dtype in ("fp32", "bf16") else np.float16
+            matrix_arr = np.frombuffer(matrix_bytes, dtype=np_dt).reshape((rows, cols))
+
+        if dtype == "bf16":
+            matrix_arr = self.engine.truncate_to_bf16(matrix_arr)
+
+        # 5. Pin in SessionManager
+        try:
+            session = self.session_manager.lease_matrix(
+                lease_id=lease_id,
+                matrix=matrix_arr,
+                rows=rows,
+                cols=cols,
+                dtype=dtype,
+                ttl_seconds=float(ttl_seconds),
+                require_confidential_compute=bool(request.require_confidential_compute),
+                client_ephemeral_pubkey=request.client_ephemeral_pubkey if request.require_confidential_compute else None,
+                session_keys=session_keys,
+            )
+        except (ValueError, KeyError) as exc:
+            self._abort(context, grpc.StatusCode.ALREADY_EXISTS, str(exc))
+        except (MemoryError, RuntimeError) as exc:
+            self._abort(context, grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+        except Exception as exc:
+            self._abort(context, grpc.StatusCode.RESOURCE_EXHAUSTED, f"Session allocation failed: {exc}")
+
+        worker_pubkey = self.signer.get_pubkey_hex() if self.signer is not None else ""
+
+        return pb2.LeaseMatrixResponse(
+            lease_id=lease_id,
+            is_accepted=True,
+            expires_at_unix_ms=int(session.expires_at_unix_ms),
+            worker_pubkey=worker_pubkey,
+            message=f"Lease accepted for {rows}x{cols} ({dtype})",
+            worker_ephemeral_pubkey=worker_ephemeral_pubkey,
+        )
+
+    def StepIterative(
+        self,
+        request: pb2.IterativeStepRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.IterativeStepResponse:
+        """
+        Executes a single matrix-vector multiplication step (v_{t+1} = A * v_t)
+        using the pinned matrix tensor. Handles decryption, GEMV math, encryption, and signing.
+        """
+        lease_id = str(request.lease_id).strip()
+        if not lease_id:
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "lease_id must not be empty")
+
+        # 1. Session Lookup & Expiration Check
+        session = self.session_manager.get_session(lease_id)
+        if session is None or session.matrix is None:
+            self._abort(
+                context,
+                grpc.StatusCode.NOT_FOUND,
+                f"Active lease '{lease_id}' not found or has been evicted",
+            )
+
+        if session.is_expired():
+            self.session_manager.evict_expired()
+            self._abort(
+                context,
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"Lease '{lease_id}' has expired at {session.expires_at_unix_ms}",
+            )
+
+        session.touch()
+
+        # 2. Confidential Decryption
+        raw_vector_bytes = request.vector_bytes
+        if session.require_confidential_compute:
+            if not request.is_encrypted:
+                self._abort(
+                    context,
+                    grpc.StatusCode.PERMISSION_DENIED,
+                    "Confidential compute enabled: step request must be encrypted",
+                )
+            if len(request.iv) != 12 or len(request.tag) != 16:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"Invalid AES-GCM framing: IV must be 12 bytes (got {len(request.iv)}), tag must be 16 bytes (got {len(request.tag)})",
+                )
+
+            step_aad = f"{lease_id}:step:{request.step_index}".encode("utf-8")
+            try:
+                raw_vector_bytes = aes_gcm_decrypt(
+                    key=session.session_keys.k_c2w,
+                    iv=request.iv,
+                    ciphertext=request.vector_bytes,
+                    tag=request.tag,
+                    aad=None,
+                    fallback_aads=[step_aad, b""],
+                )
+            except (EnclaveDecryptionError, EnclaveFramingError, Exception) as exc:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, f"Step vector decryption failed: {exc}")
+        else:
+            if request.is_encrypted:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "Session is unencrypted but request indicated is_encrypted=True",
+                )
+
+        # 3. Vector Deserialization & Dimensionality Check
+        expected_cols = session.cols
+        if request.vector_length and request.vector_length != expected_cols:
+            self._abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Vector dimension mismatch: matrix inner dimension is {expected_cols}, request vector length is {request.vector_length}",
+            )
+
+        item_size = 4 if session.dtype in ("fp32", "bf16") else 2
+        expected_len = expected_cols * item_size
+
+        if len(raw_vector_bytes) != expected_len:
+            if session.dtype == "bf16" and len(raw_vector_bytes) == expected_cols * 2:
+                raw_u16 = np.frombuffer(raw_vector_bytes, dtype=np.uint16)
+                raw_u32 = raw_u16.astype(np.uint32) << 16
+                vec = raw_u32.view(np.float32)
+            else:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"Vector byte size mismatch: expected {expected_len} bytes for vector of length {expected_cols} ({session.dtype}), got {len(raw_vector_bytes)} bytes",
+                )
+        else:
+            np_dt = np.float32 if session.dtype in ("fp32", "bf16") else np.float16
+            vec = np.frombuffer(raw_vector_bytes, dtype=np_dt)
+
+        if vec.size != expected_cols:
+            self._abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Vector dimension mismatch: matrix inner dimension is {expected_cols}, vector length is {vec.size}",
+            )
+
+        # 4. Fast GEMV Execution
+        t_start = time.perf_counter()
+        try:
+            result_vec = self.engine.gemv(session.matrix, vec, dtype=session.dtype)
+        except Exception as exc:
+            self._abort(context, grpc.StatusCode.INTERNAL, f"GEMV execution error: {exc}")
+        t_elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+        try:
+            session.record_step()
+        except SessionExpiredError as exp_err:
+            self._abort(
+                context,
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Session expired or zeroized during step execution",
+            )
+
+        raw_result_bytes = result_vec.tobytes()
+
+        # 5. Confidential Result Encryption
+        res_is_encrypted = False
+        res_iv = b""
+        res_tag = b""
+        result_vector_bytes = raw_result_bytes
+
+        if session.require_confidential_compute:
+            try:
+                ct, iv, tag = aes_gcm_encrypt(
+                    key=session.session_keys.k_w2c,
+                    plaintext=raw_result_bytes,
+                    aad=None,
+                )
+                result_vector_bytes = ct
+                res_iv = iv
+                res_tag = tag
+                res_is_encrypted = True
+            except Exception as exc:
+                self._abort(context, grpc.StatusCode.INTERNAL, f"Result encryption failed: {exc}")
+
+        # 6. Secp256k1 Result Signing
+        r_hash = hashlib.sha256(result_vector_bytes).hexdigest()
+        sig = ""
+        if self.signer is not None:
+            payload_to_sign = f"{lease_id}:{request.step_index}:{r_hash}".encode("utf-8")
+            sig = self.signer.sign_message(payload_to_sign)
+
+        return pb2.IterativeStepResponse(
+            lease_id=lease_id,
+            step_index=request.step_index,
+            result_vector_bytes=result_vector_bytes,
+            vector_length=int(session.rows),
+            worker_signature=sig,
+            execution_time_ms=max(t_elapsed_ms, 1),
+            is_encrypted=res_is_encrypted,
+            iv=res_iv,
+            tag=res_tag,
+        )
+
+    def ReleaseLease(
+        self,
+        request: pb2.ReleaseLeaseRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.ReleaseLeaseResponse:
+        """
+        Explicitly releases the leased matrix tensor, executes cryptographic zeroization,
+        and reclaims memory in SessionManager.
+        """
+        lease_id = str(request.lease_id).strip()
+        if not lease_id:
+            self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "lease_id must not be empty")
+
+        bytes_freed = self.session_manager.release_lease(lease_id)
+        is_released = bytes_freed > 0
+        if is_released:
+            msg = f"Lease '{lease_id}' successfully released; {bytes_freed} bytes zeroized and reclaimed"
+        else:
+            msg = f"Lease '{lease_id}' was not active or already released"
+
+        return pb2.ReleaseLeaseResponse(
+            lease_id=lease_id,
+            is_released=is_released,
+            bytes_freed=bytes_freed,
+            message=msg,
+        )
