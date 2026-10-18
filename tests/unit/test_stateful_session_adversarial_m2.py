@@ -287,6 +287,9 @@ class TestGemvNumericalBounds:
         if dtype == "fp16":
             a_in = a.astype(np.float16)
             v_in = v.astype(np.float16)
+        elif dtype == "bf16":
+            a_in = ComputeEngine.truncate_to_bf16(a)
+            v_in = ComputeEngine.truncate_to_bf16(v)
         else:
             a_in = a
             v_in = v
@@ -298,8 +301,8 @@ class TestGemvNumericalBounds:
         v_f64 = v_in.astype(np.float64)
         y_ref = np.matmul(a_f64, v_f64)
 
-        # Theoretical Higham bound
-        ku = float(k) * u
+        # Theoretical Higham bound (k inner terms + 1 output rounding)
+        ku = float(k + 1) * u
         gamma_k = (ku / (1.0 - ku)) if ku < 0.999 else (ku * 1000.0)
         norm_a = float(np.linalg.norm(a_f64, ord=np.inf))
         norm_v = float(np.linalg.norm(v_f64, ord=np.inf))

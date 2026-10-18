@@ -171,6 +171,8 @@ class PinnedTensorSession:
             if self.matrix is not None:
                 try:
                     if isinstance(self.matrix, np.ndarray):
+                        if not self.matrix.flags.writeable:
+                            self.matrix.setflags(write=True)
                         self.matrix.fill(0)
                 except Exception as exc:
                     logger.warning("Error zeroizing matrix for lease '%s': %s", self.lease_id, exc)
@@ -408,7 +410,7 @@ class SessionManager:
         else:
             raise InvalidMatrixDimensionsError("Must provide either matrix_bytes or matrix array")
 
-        pinned_matrix = np.ascontiguousarray(matrix_arr)
+        pinned_matrix = np.array(matrix_arr, copy=True, order='C')
         alloc_bytes = int(pinned_matrix.nbytes)
 
         # Step 4: Validate capacity and bounds under lock
@@ -464,10 +466,10 @@ class SessionManager:
         )
         return session
 
-    def get_session(self, lease_id: str) -> Optional[PinnedTensorSession]:
+    def get_session(self, lease_id: str, allow_expired: bool = False) -> Optional[PinnedTensorSession]:
         """
         Retrieves active session for lease_id.
-        Performs lazy eviction if session has expired, returning None.
+        Performs lazy eviction if session has expired, returning None unless allow_expired=True.
         """
         clean_id = str(lease_id).strip()
         with self._lock:
@@ -476,6 +478,8 @@ class SessionManager:
                 return None
 
             if session.is_expired():
+                if allow_expired:
+                    return session
                 logger.info("Lazy eviction: Session '%s' expired, releasing resources", clean_id)
                 self._sessions.pop(clean_id, None)
                 freed = session.zeroize()

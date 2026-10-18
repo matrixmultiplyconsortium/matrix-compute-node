@@ -115,7 +115,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         session_manager: Optional[SessionManager] = None,
     ) -> None:
         self.signer = signer
-        self.gate = gate or L402PreAllocationGate()
+        self.gate = gate
         self.engine = engine or ComputeEngine()
         self.config = config
         self.enclave_core = enclave_core or EnclaveComputeCore(
@@ -506,7 +506,46 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         ttl_seconds = int(request.ttl_seconds) if request.ttl_seconds > 0 else 3600
         ttl_seconds = min(ttl_seconds, 86400)  # Maximum 24h
 
-        # 2. Extract Authorization metadata & Perform Upfront L402 Gate Verification
+        # 2. Confidential Computing Handshake (X25519 ECDH)
+        item_size = 4 if dtype in ("fp32", "bf16") else 2
+        expected_raw_bytes = rows * cols * item_size
+
+        worker_ephemeral_pubkey = b""
+        session_keys = None
+
+        if request.require_confidential_compute:
+            if not request.client_ephemeral_pubkey or len(request.client_ephemeral_pubkey) != 32:
+                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "client_ephemeral_pubkey must be exactly 32 bytes")
+
+            from cryptography.hazmat.primitives.asymmetric import x25519
+            from cryptography.hazmat.primitives import serialization
+
+            try:
+                worker_ephemeral_priv = x25519.X25519PrivateKey.generate()
+                worker_ephemeral_pub = worker_ephemeral_priv.public_key()
+                worker_ephemeral_pubkey = worker_ephemeral_pub.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+
+                # Derive directional keys K_c2w, K_w2c using HKDF-SHA256
+                salt = hashlib.sha256(f"iterative:{lease_id}".encode("utf-8")).digest()
+                session_keys = derive_session_keys(
+                    worker_priv=worker_ephemeral_priv,
+                    client_pub_bytes=request.client_ephemeral_pubkey,
+                    client_nonce=salt,
+                )
+            except Exception as exc:
+                self._abort(context, grpc.StatusCode.INTERNAL, f"ECDH key exchange failed: {exc}")
+
+            if len(request.matrix_bytes) != expected_raw_bytes + 28:
+                self._abort(
+                    context,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "Confidential compute requires 28-byte encrypted framing (IV + ciphertext + tag)",
+                )
+
+        # 3. Extract Authorization metadata & Perform Upfront L402 Gate Verification
         auth_header = ""
         meta_lease_id = None
         if context is not None:
@@ -538,35 +577,6 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                     elif err_code == "FAILED_PRECONDITION":
                         status = grpc.StatusCode.FAILED_PRECONDITION
                     self._abort(context, status, err_msg or "L402 Pre-allocation check failed")
-
-        # 3. Confidential Computing Handshake (X25519 ECDH)
-        worker_ephemeral_pubkey = b""
-        session_keys = None
-
-        if request.require_confidential_compute:
-            if not request.client_ephemeral_pubkey or len(request.client_ephemeral_pubkey) != 32:
-                self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "client_ephemeral_pubkey must be exactly 32 bytes")
-
-            from cryptography.hazmat.primitives.asymmetric import x25519
-            from cryptography.hazmat.primitives import serialization
-
-            try:
-                worker_ephemeral_priv = x25519.X25519PrivateKey.generate()
-                worker_ephemeral_pub = worker_ephemeral_priv.public_key()
-                worker_ephemeral_pubkey = worker_ephemeral_pub.public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw,
-                )
-
-                # Derive directional keys K_c2w, K_w2c using HKDF-SHA256
-                salt = hashlib.sha256(f"iterative:{lease_id}".encode("utf-8")).digest()
-                session_keys = derive_session_keys(
-                    worker_priv=worker_ephemeral_priv,
-                    client_pub_bytes=request.client_ephemeral_pubkey,
-                    client_nonce=salt,
-                )
-            except Exception as exc:
-                self._abort(context, grpc.StatusCode.INTERNAL, f"ECDH key exchange failed: {exc}")
 
         # 4. Matrix Deserialization & Payload Validation
         item_size = 4 if dtype in ("fp32", "bf16") else 2
@@ -660,7 +670,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
             self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, "lease_id must not be empty")
 
         # 1. Session Lookup & Expiration Check
-        session = self.session_manager.get_session(lease_id)
+        session = self.session_manager.get_session(lease_id, allow_expired=True)
         if session is None or session.matrix is None:
             self._abort(
                 context,
