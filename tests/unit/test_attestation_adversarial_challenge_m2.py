@@ -336,12 +336,26 @@ class TestAttestationBoundaryConditions:
             matrix_b_cols=32,
             dtype="fp32",
             require_confidential_compute=True,
-            client_ephemeral_pubkey=all_zeros,
-            attestation_nonce=all_ones,
+            client_ephemeral_pubkey=all_ones,
+            attestation_nonce=all_zeros,
         )
         ack = servicer.RequestTileTask(req)
         assert ack.is_ready is True
         assert len(ack.worker_ephemeral_pubkey) == 32
+
+        # 3. Servicer rejects weak null-point key (all zeros) for X25519
+        req_null = pb2.TileTaskRequest(
+            task_id="boundary-null-key",
+            matrix_a_rows=32,
+            matrix_a_cols=32,
+            matrix_b_cols=32,
+            dtype="fp32",
+            require_confidential_compute=True,
+            client_ephemeral_pubkey=all_zeros,
+            attestation_nonce=all_ones,
+        )
+        with pytest.raises(ValueError, match="Enclave key exchange failed"):
+            servicer.RequestTileTask(req_null)
 
 
 # ==============================================================================

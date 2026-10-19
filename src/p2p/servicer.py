@@ -620,7 +620,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 )
         else:
             np_dt = np.float32 if dtype in ("fp32", "bf16") else np.float16
-            matrix_arr = np.frombuffer(matrix_bytes, dtype=np_dt).reshape((rows, cols))
+            matrix_arr = np.frombuffer(bytearray(matrix_bytes), dtype=np_dt).reshape((rows, cols))
 
         if dtype == "bf16":
             matrix_arr = self.engine.truncate_to_bf16(matrix_arr)

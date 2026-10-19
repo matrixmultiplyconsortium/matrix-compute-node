@@ -402,47 +402,45 @@ class TestPydanticHardwareSpecsValidation:
         """
         Adversarial Observation:
         In matrix_contracts.schemas.discovery, HardwareSpecs defines:
-          vram_mb: int = Field(..., description="Total VRAM in Megabytes")
+          vram_mb: int = Field(..., ge=0, description="Total VRAM in Megabytes")
           peak_fp32_tflops: float = Field(..., description="Peak FP32 TFLOPS rating")
-        Because the contract schema lacks gt=0 or ge=0, HardwareSpecs accepts negative numbers.
-        This test formally records that behavior.
+        The contract schema strictly rejects negative numbers with ValidationError.
         """
         # Negative VRAM
-        specs_neg_vram = HardwareSpecs(
-            gpu_model="RTX 4090",
-            vram_mb=-1024,
-            peak_fp32_tflops=82.6,
-            attestation_proof="a" * 128,
-        )
-        assert specs_neg_vram.vram_mb == -1024
+        with pytest.raises(ValidationError):
+            HardwareSpecs(
+                gpu_model="RTX 4090",
+                vram_mb=-1024,
+                peak_fp32_tflops=82.6,
+                attestation_proof="a" * 128,
+            )
 
         # Negative TFLOPS
-        specs_neg_tflops = HardwareSpecs(
-            gpu_model="RTX 4090",
-            vram_mb=24576,
-            peak_fp32_tflops=-10.0,
-            attestation_proof="a" * 128,
-        )
-        assert specs_neg_tflops.peak_fp32_tflops == -10.0
+        with pytest.raises(ValidationError):
+            HardwareSpecs(
+                gpu_model="RTX 4090",
+                vram_mb=24576,
+                peak_fp32_tflops=-10.0,
+                attestation_proof="a" * 128,
+            )
 
     def test_nan_and_infinity_tflops_handling(self):
         """Checks behavior with special float values (NaN, Inf, -Inf)."""
-        # Standard Pydantic float accepts NaN / Inf unless allow_inf_nan=False
-        specs_nan = HardwareSpecs(
-            gpu_model="RTX 4090",
-            vram_mb=24576,
-            peak_fp32_tflops=float("nan"),
-            attestation_proof="a" * 128,
-        )
-        assert math.isnan(specs_nan.peak_fp32_tflops)
+        with pytest.raises(ValidationError):
+            HardwareSpecs(
+                gpu_model="RTX 4090",
+                vram_mb=24576,
+                peak_fp32_tflops=float("nan"),
+                attestation_proof="a" * 128,
+            )
 
-        specs_inf = HardwareSpecs(
-            gpu_model="RTX 4090",
-            vram_mb=24576,
-            peak_fp32_tflops=float("inf"),
-            attestation_proof="a" * 128,
-        )
-        assert math.isinf(specs_inf.peak_fp32_tflops)
+        with pytest.raises(ValidationError):
+            HardwareSpecs(
+                gpu_model="RTX 4090",
+                vram_mb=24576,
+                peak_fp32_tflops=float("inf"),
+                attestation_proof="a" * 128,
+            )
 
     def test_extreme_numeric_values(self):
         """Pydantic handles large integer and float boundaries safely."""

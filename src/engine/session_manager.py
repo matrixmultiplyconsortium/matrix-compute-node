@@ -383,6 +383,8 @@ class SessionManager:
                 raise InvalidMatrixDimensionsError(
                     f"Matrix shape mismatch: got {matrix_arr.shape}, expected ({rows}, {cols})"
                 )
+            if not matrix_arr.flags.writeable:
+                matrix_arr = matrix_arr.copy()
             if norm_dtype == "bf16":
                 matrix_arr = ComputeEngine.truncate_to_bf16(matrix_arr)
         elif isinstance(mat_or_bytes, (bytes, bytearray)):
@@ -397,20 +399,21 @@ class SessionManager:
                         f"{rows}x{cols} ({norm_dtype}), got {len(mat_or_bytes)} bytes"
                     )
 
+            writable_bytes = bytearray(mat_or_bytes)
             if norm_dtype == "bf16" and elem_size == 2:
-                u16 = np.frombuffer(mat_or_bytes, dtype=np.uint16).reshape((rows, cols))
+                u16 = np.frombuffer(writable_bytes, dtype=np.uint16).reshape((rows, cols))
                 u32 = u16.astype(np.uint32) << 16
                 raw_matrix = u32.view(np.float32)
                 matrix_arr = ComputeEngine.truncate_to_bf16(raw_matrix)
             elif norm_dtype == "bf16":
-                raw_matrix = np.frombuffer(mat_or_bytes, dtype=np.float32).reshape((rows, cols))
+                raw_matrix = np.frombuffer(writable_bytes, dtype=np.float32).reshape((rows, cols))
                 matrix_arr = ComputeEngine.truncate_to_bf16(raw_matrix)
             else:
-                matrix_arr = np.frombuffer(mat_or_bytes, dtype=np_dtype).reshape((rows, cols))
+                matrix_arr = np.frombuffer(writable_bytes, dtype=np_dtype).reshape((rows, cols))
         else:
             raise InvalidMatrixDimensionsError("Must provide either matrix_bytes or matrix array")
 
-        pinned_matrix = np.array(matrix_arr, copy=True, order='C')
+        pinned_matrix = matrix_arr
         alloc_bytes = int(pinned_matrix.nbytes)
 
         # Step 4: Validate capacity and bounds under lock

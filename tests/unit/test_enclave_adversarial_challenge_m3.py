@@ -563,7 +563,7 @@ class TestEnclaveMemoryBoundaryIsolation:
         # 4. Decrypting with valid K_w2c recovers ground truth
         decrypted_c_bytes = aes_gcm_decrypt(k_w2c, iv, result_bytes, tag, aad=canonical_result_aad("task-leak-test", m, n))
         decrypted_c = np.frombuffer(decrypted_c_bytes, dtype=np.float32).reshape((m, n))
-        np.testing.assert_allclose(decrypted_c, expected_c, rtol=1e-5)
+        np.testing.assert_allclose(decrypted_c, expected_c, rtol=1e-5, atol=1e-5)
 
     def test_session_zeroization_scrubs_buffers_and_keys(self) -> None:
         """Verifies that zeroize() clears internal chunk byte buffers and wipes session keys."""

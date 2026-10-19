@@ -543,6 +543,7 @@ class TestR3L402GateAndAttestation:
             assert err is None
 
         # When status is UNPAID, it must reject with FAILED_PRECONDITION
+        gate.clear_cache()
         mock_resp.json.return_value = {"status": "UNPAID"}
         with patch("httpx.Client.get", return_value=mock_resp):
             ok, err, code = gate.verify_token(auth_header, "task_http", 10, 10, 10)

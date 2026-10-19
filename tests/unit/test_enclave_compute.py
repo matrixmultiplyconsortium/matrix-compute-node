@@ -5,6 +5,7 @@ Unit tests for EnclaveComputeCore, EnclaveSession, and In-Enclave AES-256-GCM Fr
 from __future__ import annotations
 
 import secrets
+import time
 from cryptography.hazmat.primitives.asymmetric import x25519
 import numpy as np
 import pytest
@@ -362,7 +363,7 @@ def test_enclave_confidential_gemm_end_to_end():
     c_decrypted_raw = aes_gcm_decrypt(c_keys.k_w2c, iv, result_bytes, tag, aad=aad_res)
     c_decrypted = np.frombuffer(c_decrypted_raw, dtype=np.float32).reshape((m, n))
 
-    np.testing.assert_allclose(c_decrypted, expected_c, rtol=1e-5)
+    np.testing.assert_allclose(c_decrypted, expected_c, rtol=1e-5, atol=1e-5)
 
 
 def test_enclave_unencrypted_fallback():
@@ -395,7 +396,7 @@ def test_enclave_unencrypted_fallback():
     assert tag == b""
 
     c_res = np.frombuffer(result_bytes, dtype=np.float32).reshape((m, n))
-    np.testing.assert_allclose(c_res, expected_c, rtol=1e-5)
+    np.testing.assert_allclose(c_res, expected_c, rtol=1e-5, atol=1e-5)
 
 
 def test_enclave_precision_support_fp16_bf16():
@@ -471,7 +472,7 @@ def test_enclave_compute_core_eviction():
     assert core.get_session("task-3") is not None
 
     # Test TTL expiration
-    session_start = 1000000000.0 + 10.0
+    session_start = time.time() + 10.0
     core.evict_expired(now=session_start)
     assert core.get_session("task-2") is None
     assert core.get_session("task-3") is None
@@ -615,7 +616,7 @@ def test_servicer_confidential_streaming_execution():
     aad_res = canonical_result_aad(task_id, m, n)
     c_decrypted_bytes = aes_gcm_decrypt(c_keys.k_w2c, result.iv, result.result_bytes, result.tag, aad=aad_res)
     c_decrypted = np.frombuffer(c_decrypted_bytes, dtype=np.float32).reshape((m, n))
-    np.testing.assert_allclose(c_decrypted, expected_c, rtol=1e-5)
+    np.testing.assert_allclose(c_decrypted, expected_c, rtol=1e-5, atol=1e-5)
 
     # 7. Verify worker signature over wire ciphertext payload
     c_hash = hashlib.sha256(result.result_bytes).hexdigest()

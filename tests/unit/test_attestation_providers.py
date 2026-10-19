@@ -155,11 +155,12 @@ def test_simulated_provider_fault_injection() -> None:
     ev_nonce = p_nonce.generate_evidence(nonce=nonce, public_key=pubkey)
     assert ev_nonce.token_claims["nonce"] != nonce.hex()
 
-    # 4. Expired cert
     p_exp = SimulatedAttestationProvider(expired_cert=True)
     ev_exp = p_exp.generate_evidence(nonce=nonce, public_key=pubkey)
     cert = x509.load_pem_x509_certificate(ev_exp.certificate_chain[0].encode("utf-8"))
-    assert cert.not_valid_after_utc < cert.not_valid_before_utc.replace(year=cert.not_valid_before_utc.year + 2)
+    nva = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
+    nvb = getattr(cert, "not_valid_before_utc", cert.not_valid_before)
+    assert nva < nvb.replace(year=nvb.year + 2)
 
     # 5. Untrusted CA
     p_untrusted = SimulatedAttestationProvider(untrusted_ca=True)
