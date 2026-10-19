@@ -119,6 +119,10 @@ class NostrRelayClient:
             ["min_task_sats", str(pricing_specs.min_task_sats)],
             ["staked_sats", str(bond_status.staked_amount_sats)],
         ]
+        if getattr(hardware_specs, "tee", False):
+            tags.append(["tee", "true"])
+        if getattr(hardware_specs, "tee_type", None):
+            tags.append(["tee_type", str(hardware_specs.tee_type)])
 
         # Canonical event serialization for ID calculation: [0, pubkey, created_at, kind, tags, content]
         serialized_event = json.dumps(
