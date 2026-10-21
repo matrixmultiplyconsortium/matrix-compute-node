@@ -194,18 +194,24 @@ class L402PreAllocationGate:
             try:
                 import httpx
                 with httpx.Client(timeout=5.0) as client:
-                    resp = client.get(f"{base_url}/invoices/{payment_hash}")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, dict):
-                            raw_status = data.get("status") or data.get("invoice_status")
-                            status = str(raw_status).strip().upper() if raw_status else None
-                        elif isinstance(data, str):
-                            status = data.strip().upper()
+                    # Allow up to 3 attempts (0.2s backoff) if invoice is still UNPAID due to WAN/Lightning gossip latency
+                    for attempt in range(3):
+                        resp = client.get(f"{base_url}/invoices/{payment_hash}")
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if isinstance(data, dict):
+                                raw_status = data.get("status") or data.get("invoice_status")
+                                status = str(raw_status).strip().upper() if raw_status else None
+                            elif isinstance(data, str):
+                                status = data.strip().upper()
+                            else:
+                                status = None
+                            if status == "HELD" or status in ("SETTLED", "CANCELLED") or attempt == 2:
+                                break
+                            time.sleep(0.2)
                         else:
                             status = None
-                    else:
-                        status = None
+                            break
             except Exception as ex:
                 logger.warning("HTTP settlement verification query failed: %s", ex)
                 return None, f"Settlement HTTP query failed: {ex}"

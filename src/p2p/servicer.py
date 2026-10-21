@@ -437,8 +437,11 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                     self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
             # Finalize and execute in-enclave GEMM, encrypt output
+            should_inject_fraud = bool(getattr(self.config, "inject_fraud", False))
             try:
-                result_bytes, iv, tag, is_encrypted, exec_time_ms = session.execute_and_encrypt()
+                result_bytes, iv, tag, is_encrypted, exec_time_ms = session.execute_and_encrypt(
+                    inject_fraud=should_inject_fraud
+                )
             except EnclaveExecutionError as exc:
                 self._abort(context, grpc.StatusCode.INTERNAL, str(exc))
             except EnclaveFramingError as exc:

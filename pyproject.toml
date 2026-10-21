@@ -7,7 +7,7 @@ name = "matrix-compute-node"
 version = "0.1.0"
 description = "Decentralized worker daemon for Distributed Matrix Multiplication network"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [
     { name = "Distributed Matrix Multiply Team" }

@@ -402,7 +402,7 @@ class EnclaveSession:
             if chunk.is_final_chunk:
                 self._final_seen = True
 
-    def execute_and_encrypt(self) -> Tuple[bytes, bytes, bytes, bool, int]:
+    def execute_and_encrypt(self, inject_fraud: bool = False) -> Tuple[bytes, bytes, bytes, bool, int]:
         """
         Finalizes chunk assembly, executes GEMM inside enclave memory,
         and encrypts the result using K_w2c.
@@ -437,6 +437,10 @@ class EnclaveSession:
             except Exception as exc:
                 raise EnclaveExecutionError(f"In-enclave GEMM calculation failed: {exc}") from exc
             exec_time_ms = int((time.perf_counter() - start_time) * 1000)
+
+            if inject_fraud:
+                matrix_c = np.array(matrix_c, copy=True)
+                matrix_c = matrix_c + np.asarray(1000.0, dtype=matrix_c.dtype)
 
             c_raw = matrix_c.tobytes()
 

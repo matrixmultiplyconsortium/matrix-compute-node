@@ -76,6 +76,9 @@ class WorkerDaemon:
             options=[
                 ("grpc.max_receive_message_length", config.grpc_max_message_bytes),
                 ("grpc.max_send_message_length", config.grpc_max_message_bytes),
+                ("grpc.keepalive_permit_without_calls", 1),
+                ("grpc.http2.min_ping_interval_without_data_ms", 5000),
+                ("grpc.http2.max_ping_strikes", 0),
             ],
         )
         pb2_grpc.add_MatrixComputeServiceServicer_to_server(self.servicer, self.server)
@@ -95,10 +98,10 @@ class WorkerDaemon:
         logger.info(f"Worker Public Key (hex):  {self.signer.get_pubkey_hex()}")
 
         # 1. Attest hardware
-        hardware_specs = self.attestation_engine.detect_hardware()
+        self.hardware_specs = self.attestation_engine.detect_hardware()
         logger.info(
-            f"Detected Hardware: {hardware_specs.gpu_model} "
-            f"({hardware_specs.vram_mb} MB VRAM, {hardware_specs.peak_fp32_tflops} TFLOPS)"
+            f"Detected Hardware: {self.hardware_specs.gpu_model} "
+            f"({self.hardware_specs.vram_mb} MB VRAM, {self.hardware_specs.peak_fp32_tflops} TFLOPS)"
         )
 
         # 2. Start gRPC server
@@ -106,6 +109,10 @@ class WorkerDaemon:
         logger.info(f"P2P gRPC server listening on {self.config.p2p_host}:{self.config.p2p_port}")
 
         # 3. Announce to Nostr relays
+        self._announce_once()
+
+    def _announce_once(self) -> bool:
+        """Builds and publishes a fresh Kind 30000 announcement event."""
         try:
             self.nostr_client.connect()
             pricing_specs = PricingSpecs(
@@ -116,21 +123,27 @@ class WorkerDaemon:
                 staked_amount_sats=100000,
                 bond_txid="genesis_bond_txid_001",
             )
-            multiaddr = self.config.p2p_multiaddr or f"/ip4/127.0.0.1/tcp/{self.config.p2p_port}"
+            multiaddr = self.config.resolve_advertised_multiaddr()
             lightning_pubkey = self.config.lightning_routing_pubkey or self.signer.get_pubkey_hex()
 
             event = self.nostr_client.build_announce_event(
                 signer=self.signer,
-                hardware_specs=hardware_specs,
+                hardware_specs=self.hardware_specs,
                 pricing_specs=pricing_specs,
                 bond_status=bond_status,
                 p2p_multiaddr=multiaddr,
                 lightning_pubkey=lightning_pubkey,
             )
-            self.nostr_client.publish_announce(event)
-            logger.info("Worker availability announced on Nostr relays (Kind 30000)")
+            ok = self.nostr_client.publish_announce(event)
+            if ok:
+                logger.info(
+                    f"Worker availability announced on Nostr relays (Kind 30000) "
+                    f"with multiaddr={multiaddr}, lightning_pubkey={lightning_pubkey[:16]}..."
+                )
+            return ok
         except Exception as ex:
             logger.warning(f"Nostr announcement skipped/deferred: {ex}")
+            return False
 
     def stop(self, grace: float = 2.0) -> None:
         """Stops the daemon cleanly."""
@@ -143,9 +156,13 @@ class WorkerDaemon:
     def run_forever(self) -> None:
         """Runs the daemon blocking until SIGINT/SIGTERM."""
         self.start()
+        last_announce = time.time()
         try:
             while not self.stop_event.is_set():
                 time.sleep(0.5)
+                if time.time() - last_announce >= 30.0:
+                    self._announce_once()
+                    last_announce = time.time()
         except KeyboardInterrupt:
             pass
         finally:

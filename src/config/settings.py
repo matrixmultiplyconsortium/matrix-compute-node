@@ -61,6 +61,10 @@ class NodeConfig(BaseModel):
         "auto",
         description="Attestation provider: 'auto', 'nvidia-cca', 'simulated-cca', 'none'",
     )
+    inject_fraud: bool = Field(
+        False,
+        description="Stage 03 fault-injection flag: intentionally perturbs GEMM output to test Freivalds & HODL cancellation",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -74,24 +78,52 @@ class NodeConfig(BaseModel):
 
         env_mappings = {
             "worker_privkey_hex": ["MATRIX_WORKER_PRIVKEY", "MATRIX_WORKER_PRIVKEY_HEX", "WORKER_PRIVKEY", "WORKER_PRIVKEY_HEX"],
-            "p2p_host": ["MATRIX_P2P_HOST", "P2P_HOST"],
-            "p2p_port": ["MATRIX_P2P_PORT", "P2P_PORT"],
-            "p2p_multiaddr": ["MATRIX_P2P_MULTIADDR", "P2P_MULTIADDR"],
-            "lightning_routing_pubkey": ["MATRIX_LIGHTNING_ROUTING_PUBKEY", "LIGHTNING_ROUTING_PUBKEY"],
-            "nostr_relays": ["MATRIX_NOSTR_RELAYS", "NOSTR_RELAYS"],
-            "settlement_api_url": ["MATRIX_SETTLEMENT_API_URL", "MATRIX_SETTLEMENT_URL", "SETTLEMENT_API_URL", "SETTLEMENT_URL"],
-            "settlement_verification_key": ["MATRIX_SETTLEMENT_VERIFICATION_KEY", "SETTLEMENT_VERIFICATION_KEY"],
-            "sats_per_gflop": ["MATRIX_SATS_PER_GFLOP", "SATS_PER_GFLOP"],
-            "min_task_sats": ["MATRIX_MIN_TASK_SATS", "MIN_TASK_SATS"],
-            "gpu_device_index": ["MATRIX_GPU_DEVICE_INDEX", "GPU_DEVICE_INDEX"],
-            "dtype_preference": ["MATRIX_DTYPE_PREFERENCE", "DTYPE_PREFERENCE"],
-            "log_level": ["MATRIX_LOG_LEVEL", "LOG_LEVEL"],
-            "grpc_max_workers": ["MATRIX_GRPC_MAX_WORKERS", "GRPC_MAX_WORKERS"],
+            "p2p_host": ["MATRIX_P2P_HOST", "MATRIX_WORKER_P2P_HOST", "P2P_HOST"],
+            "p2p_port": ["MATRIX_P2P_PORT", "MATRIX_WORKER_P2P_PORT", "P2P_PORT"],
+            "p2p_multiaddr": ["MATRIX_P2P_MULTIADDR", "MATRIX_WORKER_P2P_MULTIADDR", "P2P_MULTIADDR"],
+            "lightning_routing_pubkey": [
+                "MATRIX_LIGHTNING_ROUTING_PUBKEY",
+                "MATRIX_WORKER_LIGHTNING_ROUTING_PUBKEY",
+                "LIGHTNING_ROUTING_PUBKEY",
+                "WORKER_LIGHTNING_PUBKEY",
+            ],
+            "nostr_relays": ["MATRIX_NOSTR_RELAYS", "MATRIX_WORKER_NOSTR_RELAYS", "NOSTR_RELAYS"],
+            "settlement_api_url": [
+                "MATRIX_SETTLEMENT_API_URL",
+                "MATRIX_WORKER_SETTLEMENT_API_URL",
+                "MATRIX_SETTLEMENT_URL",
+                "SETTLEMENT_API_URL",
+                "SETTLEMENT_URL",
+            ],
+            "settlement_verification_key": [
+                "MATRIX_SETTLEMENT_VERIFICATION_KEY",
+                "MATRIX_WORKER_SETTLEMENT_VERIFICATION_KEY",
+                "SETTLEMENT_VERIFICATION_KEY",
+            ],
+            "sats_per_gflop": ["MATRIX_SATS_PER_GFLOP", "MATRIX_WORKER_SATS_PER_GFLOP", "SATS_PER_GFLOP"],
+            "min_task_sats": ["MATRIX_MIN_TASK_SATS", "MATRIX_WORKER_MIN_TASK_SATS", "MIN_TASK_SATS"],
+            "gpu_device_index": ["MATRIX_GPU_DEVICE_INDEX", "MATRIX_WORKER_GPU_DEVICE_INDEX", "GPU_DEVICE_INDEX"],
+            "dtype_preference": ["MATRIX_DTYPE_PREFERENCE", "MATRIX_WORKER_DTYPE_PREFERENCE", "DTYPE_PREFERENCE"],
+            "log_level": ["MATRIX_LOG_LEVEL", "MATRIX_WORKER_LOG_LEVEL", "LOG_LEVEL"],
+            "grpc_max_workers": ["MATRIX_GRPC_MAX_WORKERS", "MATRIX_WORKER_GRPC_MAX_WORKERS", "GRPC_MAX_WORKERS"],
             "grpc_max_message_bytes": ["MATRIX_GRPC_MAX_MESSAGE_BYTES", "GRPC_MAX_MESSAGE_BYTES"],
             "l402_cache_ttl_seconds": ["MATRIX_L402_CACHE_TTL_SECONDS", "L402_CACHE_TTL_SECONDS"],
             "l402_max_cache_size": ["MATRIX_L402_MAX_CACHE_SIZE", "L402_MAX_CACHE_SIZE"],
-            "enable_confidential_compute": ["MATRIX_ENABLE_CONFIDENTIAL_COMPUTE", "ENABLE_CONFIDENTIAL_COMPUTE"],
-            "attestation_provider": ["MATRIX_ATTESTATION_PROVIDER", "ATTESTATION_PROVIDER"],
+            "enable_confidential_compute": [
+                "MATRIX_ENABLE_CONFIDENTIAL_COMPUTE",
+                "MATRIX_WORKER_ENABLE_CONFIDENTIAL_COMPUTE",
+                "ENABLE_CONFIDENTIAL_COMPUTE",
+            ],
+            "attestation_provider": [
+                "MATRIX_ATTESTATION_PROVIDER",
+                "MATRIX_WORKER_ATTESTATION_PROVIDER",
+                "ATTESTATION_PROVIDER",
+            ],
+            "inject_fraud": [
+                "MATRIX_WORKER_INJECT_FRAUD",
+                "MATRIX_INJECT_FRAUD",
+                "INJECT_FRAUD",
+            ],
         }
 
         enriched = dict(data)
@@ -116,6 +148,9 @@ class NodeConfig(BaseModel):
 
         if "enable_confidential_compute" in enriched and isinstance(enriched["enable_confidential_compute"], str):
             enriched["enable_confidential_compute"] = enriched["enable_confidential_compute"].strip().lower() in ("1", "true", "yes")
+
+        if "inject_fraud" in enriched and isinstance(enriched["inject_fraud"], str):
+            enriched["inject_fraud"] = enriched["inject_fraud"].strip().lower() in ("1", "true", "yes", "on")
 
         return enriched
 
@@ -184,6 +219,65 @@ class NodeConfig(BaseModel):
             return self.p2p_multiaddr
         return f"/ip4/{self.p2p_host}/tcp/{self.p2p_port}"
 
+    def resolve_advertised_multiaddr(self, env: Optional[Dict[str, str]] = None) -> str:
+        """
+        Resolves a routable multiaddr for Nostr Kind 30000 announcements.
+        1. Uses explicit p2p_multiaddr if configured.
+        2. Auto-detects cloud GPU port-mapping env vars (Vast.ai / RunPod):
+           - Vast.ai: PUBLIC_IPADDR + VAST_TCP_PORT_{p2p_port}
+           - RunPod:  RUNPOD_PUBLIC_IP + RUNPOD_TCP_PORT_{p2p_port}
+        3. Uses /ip4/{p2p_host}/tcp/{p2p_port} if p2p_host is not a wildcard (0.0.0.0 / ::).
+        4. Otherwise probes outbound interface towards settlement_api_url or Nostr relay,
+           falling back to 127.0.0.1.
+        """
+        if self.p2p_multiaddr:
+            return self.p2p_multiaddr
+
+        environ = os.environ if env is None else env
+        # Vast.ai external TCP port mapping detection
+        vast_ip = environ.get("PUBLIC_IPADDR", "").strip()
+        vast_port = environ.get(f"VAST_TCP_PORT_{self.p2p_port}", "").strip()
+        if vast_ip and vast_port.isdigit():
+            return f"/ip4/{vast_ip}/tcp/{int(vast_port)}"
+
+        # RunPod external TCP port mapping detection
+        runpod_ip = environ.get("RUNPOD_PUBLIC_IP", "").strip()
+        runpod_port = environ.get(f"RUNPOD_TCP_PORT_{self.p2p_port}", "").strip()
+        if runpod_ip and runpod_port.isdigit():
+            return f"/ip4/{runpod_ip}/tcp/{int(runpod_port)}"
+
+        if self.p2p_host and self.p2p_host not in ("0.0.0.0", "::", ""):
+            return f"/ip4/{self.p2p_host}/tcp/{self.p2p_port}"
+
+        import socket
+        probe_targets: List[Tuple[str, int]] = []
+        try:
+            parsed_settlement = urlparse(self.settlement_api_url)
+            if parsed_settlement.hostname and parsed_settlement.hostname not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                probe_targets.append((parsed_settlement.hostname, parsed_settlement.port or 8080))
+        except Exception:
+            pass
+
+        for relay in self.nostr_relays:
+            try:
+                parsed_relay = urlparse(relay)
+                if parsed_relay.hostname and parsed_relay.hostname not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                    probe_targets.append((parsed_relay.hostname, parsed_relay.port or 8008))
+            except Exception:
+                pass
+
+        for host, port in probe_targets:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect((host, port))
+                    local_ip = s.getsockname()[0]
+                    if local_ip and not local_ip.startswith("127.") and local_ip != "0.0.0.0":
+                        return f"/ip4/{local_ip}/tcp/{self.p2p_port}"
+            except Exception:
+                continue
+
+        return f"/ip4/127.0.0.1/tcp/{self.p2p_port}"
+
     def effective_lightning_pubkey(self, default_worker_pubkey: str) -> str:
         """Returns lightning routing pubkey or defaults to worker pubkey."""
         return self.lightning_routing_pubkey or default_worker_pubkey
@@ -194,104 +288,80 @@ class NodeConfig(BaseModel):
         environ = os.environ if env is None else env
         data: Dict[str, Any] = {}
 
-        if "MATRIX_WORKER_PRIVKEY" in environ:
-            data["worker_privkey_hex"] = environ["MATRIX_WORKER_PRIVKEY"]
-        elif "MATRIX_WORKER_PRIVKEY_HEX" in environ:
-            data["worker_privkey_hex"] = environ["MATRIX_WORKER_PRIVKEY_HEX"]
-        elif "WORKER_PRIVKEY" in environ:
-            data["worker_privkey_hex"] = environ["WORKER_PRIVKEY"]
+        for field_name, env_vars in {
+            "worker_privkey_hex": ["MATRIX_WORKER_PRIVKEY", "MATRIX_WORKER_PRIVKEY_HEX", "WORKER_PRIVKEY", "WORKER_PRIVKEY_HEX"],
+            "p2p_host": ["MATRIX_P2P_HOST", "MATRIX_WORKER_P2P_HOST", "P2P_HOST"],
+            "p2p_port": ["MATRIX_P2P_PORT", "MATRIX_WORKER_P2P_PORT", "P2P_PORT"],
+            "p2p_multiaddr": ["MATRIX_P2P_MULTIADDR", "MATRIX_WORKER_P2P_MULTIADDR", "P2P_MULTIADDR"],
+            "lightning_routing_pubkey": [
+                "MATRIX_LIGHTNING_ROUTING_PUBKEY",
+                "MATRIX_WORKER_LIGHTNING_ROUTING_PUBKEY",
+                "LIGHTNING_ROUTING_PUBKEY",
+                "WORKER_LIGHTNING_PUBKEY",
+            ],
+            "nostr_relays": ["MATRIX_NOSTR_RELAYS", "MATRIX_WORKER_NOSTR_RELAYS", "NOSTR_RELAYS"],
+            "settlement_api_url": [
+                "MATRIX_SETTLEMENT_API_URL",
+                "MATRIX_WORKER_SETTLEMENT_API_URL",
+                "MATRIX_SETTLEMENT_URL",
+                "SETTLEMENT_API_URL",
+                "SETTLEMENT_URL",
+            ],
+            "settlement_verification_key": [
+                "MATRIX_SETTLEMENT_VERIFICATION_KEY",
+                "MATRIX_WORKER_SETTLEMENT_VERIFICATION_KEY",
+                "SETTLEMENT_VERIFICATION_KEY",
+            ],
+            "sats_per_gflop": ["MATRIX_SATS_PER_GFLOP", "MATRIX_WORKER_SATS_PER_GFLOP", "SATS_PER_GFLOP"],
+            "min_task_sats": ["MATRIX_MIN_TASK_SATS", "MATRIX_WORKER_MIN_TASK_SATS", "MIN_TASK_SATS"],
+            "gpu_device_index": ["MATRIX_GPU_DEVICE_INDEX", "MATRIX_WORKER_GPU_DEVICE_INDEX", "GPU_DEVICE_INDEX"],
+            "dtype_preference": ["MATRIX_DTYPE_PREFERENCE", "MATRIX_WORKER_DTYPE_PREFERENCE", "DTYPE_PREFERENCE"],
+            "log_level": ["MATRIX_LOG_LEVEL", "MATRIX_WORKER_LOG_LEVEL", "LOG_LEVEL"],
+            "l402_cache_ttl_seconds": ["MATRIX_L402_CACHE_TTL_SECONDS", "L402_CACHE_TTL_SECONDS"],
+            "l402_max_cache_size": ["MATRIX_L402_MAX_CACHE_SIZE", "L402_MAX_CACHE_SIZE"],
+            "enable_confidential_compute": [
+                "MATRIX_ENABLE_CONFIDENTIAL_COMPUTE",
+                "MATRIX_WORKER_ENABLE_CONFIDENTIAL_COMPUTE",
+                "ENABLE_CONFIDENTIAL_COMPUTE",
+            ],
+            "attestation_provider": [
+                "MATRIX_ATTESTATION_PROVIDER",
+                "MATRIX_WORKER_ATTESTATION_PROVIDER",
+                "ATTESTATION_PROVIDER",
+            ],
+            "inject_fraud": [
+                "MATRIX_WORKER_INJECT_FRAUD",
+                "MATRIX_INJECT_FRAUD",
+                "INJECT_FRAUD",
+            ],
+        }.items():
+            for env_var in env_vars:
+                if env_var in environ and environ[env_var] != "":
+                    data[field_name] = environ[env_var]
+                    break
 
-        if "MATRIX_P2P_HOST" in environ:
-            data["p2p_host"] = environ["MATRIX_P2P_HOST"]
-        elif "P2P_HOST" in environ:
-            data["p2p_host"] = environ["P2P_HOST"]
-
-        if "MATRIX_P2P_PORT" in environ:
-            data["p2p_port"] = int(environ["MATRIX_P2P_PORT"])
-        elif "P2P_PORT" in environ:
-            data["p2p_port"] = int(environ["P2P_PORT"])
-
-        if "MATRIX_P2P_MULTIADDR" in environ:
-            data["p2p_multiaddr"] = environ["MATRIX_P2P_MULTIADDR"]
-        elif "P2P_MULTIADDR" in environ:
-            data["p2p_multiaddr"] = environ["P2P_MULTIADDR"]
-
-        if "MATRIX_LIGHTNING_ROUTING_PUBKEY" in environ:
-            data["lightning_routing_pubkey"] = environ["MATRIX_LIGHTNING_ROUTING_PUBKEY"]
-        elif "LIGHTNING_ROUTING_PUBKEY" in environ:
-            data["lightning_routing_pubkey"] = environ["LIGHTNING_ROUTING_PUBKEY"]
-
-        if "MATRIX_NOSTR_RELAYS" in environ:
-            val = environ["MATRIX_NOSTR_RELAYS"].strip()
+        if "p2p_port" in data:
+            data["p2p_port"] = int(data["p2p_port"])
+        if "sats_per_gflop" in data:
+            data["sats_per_gflop"] = float(data["sats_per_gflop"])
+        if "min_task_sats" in data:
+            data["min_task_sats"] = int(data["min_task_sats"])
+        if "gpu_device_index" in data:
+            data["gpu_device_index"] = int(data["gpu_device_index"])
+        if "l402_cache_ttl_seconds" in data:
+            data["l402_cache_ttl_seconds"] = float(data["l402_cache_ttl_seconds"])
+        if "l402_max_cache_size" in data:
+            data["l402_max_cache_size"] = int(data["l402_max_cache_size"])
+        if "nostr_relays" in data and isinstance(data["nostr_relays"], str):
+            val = data["nostr_relays"].strip()
             if val.startswith("[") and val.endswith("]"):
                 data["nostr_relays"] = json.loads(val)
             else:
                 data["nostr_relays"] = [r.strip() for r in val.split(",") if r.strip()]
-        elif "NOSTR_RELAYS" in environ:
-            val = environ["NOSTR_RELAYS"].strip()
-            if val.startswith("[") and val.endswith("]"):
-                data["nostr_relays"] = json.loads(val)
-            else:
-                data["nostr_relays"] = [r.strip() for r in val.split(",") if r.strip()]
-
-        if "MATRIX_SETTLEMENT_API_URL" in environ:
-            data["settlement_api_url"] = environ["MATRIX_SETTLEMENT_API_URL"]
-        elif "MATRIX_SETTLEMENT_URL" in environ:
-            data["settlement_api_url"] = environ["MATRIX_SETTLEMENT_URL"]
-        elif "SETTLEMENT_API_URL" in environ:
-            data["settlement_api_url"] = environ["SETTLEMENT_API_URL"]
-        elif "SETTLEMENT_URL" in environ:
-            data["settlement_api_url"] = environ["SETTLEMENT_URL"]
-
-        if "MATRIX_SETTLEMENT_VERIFICATION_KEY" in environ:
-            data["settlement_verification_key"] = environ["MATRIX_SETTLEMENT_VERIFICATION_KEY"]
-        elif "SETTLEMENT_VERIFICATION_KEY" in environ:
-            data["settlement_verification_key"] = environ["SETTLEMENT_VERIFICATION_KEY"]
-
-        if "MATRIX_SATS_PER_GFLOP" in environ:
-            data["sats_per_gflop"] = float(environ["MATRIX_SATS_PER_GFLOP"])
-        elif "SATS_PER_GFLOP" in environ:
-            data["sats_per_gflop"] = float(environ["SATS_PER_GFLOP"])
-
-        if "MATRIX_MIN_TASK_SATS" in environ:
-            data["min_task_sats"] = int(environ["MATRIX_MIN_TASK_SATS"])
-        elif "MIN_TASK_SATS" in environ:
-            data["min_task_sats"] = int(environ["MIN_TASK_SATS"])
-
-        if "MATRIX_GPU_DEVICE_INDEX" in environ:
-            data["gpu_device_index"] = int(environ["MATRIX_GPU_DEVICE_INDEX"])
-        elif "GPU_DEVICE_INDEX" in environ:
-            data["gpu_device_index"] = int(environ["GPU_DEVICE_INDEX"])
-
-        if "MATRIX_DTYPE_PREFERENCE" in environ:
-            data["dtype_preference"] = environ["MATRIX_DTYPE_PREFERENCE"]
-        elif "DTYPE_PREFERENCE" in environ:
-            data["dtype_preference"] = environ["DTYPE_PREFERENCE"]
-
-        if "MATRIX_LOG_LEVEL" in environ:
-            data["log_level"] = environ["MATRIX_LOG_LEVEL"]
-        elif "LOG_LEVEL" in environ:
-            data["log_level"] = environ["LOG_LEVEL"]
-
-        if "MATRIX_L402_CACHE_TTL_SECONDS" in environ:
-            data["l402_cache_ttl_seconds"] = float(environ["MATRIX_L402_CACHE_TTL_SECONDS"])
-        elif "L402_CACHE_TTL_SECONDS" in environ:
-            data["l402_cache_ttl_seconds"] = float(environ["L402_CACHE_TTL_SECONDS"])
-
-        if "MATRIX_L402_MAX_CACHE_SIZE" in environ:
-            data["l402_max_cache_size"] = int(environ["MATRIX_L402_MAX_CACHE_SIZE"])
-        elif "L402_MAX_CACHE_SIZE" in environ:
-            data["l402_max_cache_size"] = int(environ["L402_MAX_CACHE_SIZE"])
-
-        if "MATRIX_ENABLE_CONFIDENTIAL_COMPUTE" in environ:
-            data["enable_confidential_compute"] = environ["MATRIX_ENABLE_CONFIDENTIAL_COMPUTE"].strip().lower() in ("1", "true", "yes")
-        elif "ENABLE_CONFIDENTIAL_COMPUTE" in environ:
-            data["enable_confidential_compute"] = environ["ENABLE_CONFIDENTIAL_COMPUTE"].strip().lower() in ("1", "true", "yes")
-
-        if "MATRIX_ATTESTATION_PROVIDER" in environ:
-            data["attestation_provider"] = environ["MATRIX_ATTESTATION_PROVIDER"].strip()
-        elif "ATTESTATION_PROVIDER" in environ:
-            data["attestation_provider"] = environ["ATTESTATION_PROVIDER"].strip()
+        if "enable_confidential_compute" in data and isinstance(data["enable_confidential_compute"], str):
+            data["enable_confidential_compute"] = data["enable_confidential_compute"].strip().lower() in ("1", "true", "yes")
+        if "inject_fraud" in data and isinstance(data["inject_fraud"], str):
+            data["inject_fraud"] = data["inject_fraud"].strip().lower() in ("1", "true", "yes", "on")
 
         return cls(**data)
 
@@ -423,6 +493,13 @@ class NodeConfig(BaseModel):
             type=str,
             default=None,
             help="Attestation provider ('auto', 'nvidia-cca', 'simulated-cca', 'none')",
+        )
+        parser.add_argument(
+            "--inject-fraud",
+            dest="inject_fraud",
+            action=argparse.BooleanOptionalAction if hasattr(argparse, "BooleanOptionalAction") else "store_true",
+            default=None,
+            help="Intentionally perturb GEMM output for Scenario 3 invalidation drills",
         )
         return parser
 
