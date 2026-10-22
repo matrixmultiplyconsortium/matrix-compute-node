@@ -89,6 +89,8 @@ class NostrRelayClient:
         lightning_pubkey: str,
         d_tag: str = "matrix-compute-worker",
         timestamp: Optional[int] = None,
+        nat_mode: str = "direct",
+        relay_endpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Constructs a NIP-33 Parameterized Replaceable Event (Kind 30000).
@@ -106,6 +108,8 @@ class NostrRelayClient:
             pricing=pricing_specs,
             bond_status=bond_status,
             timestamp=ts,
+            nat_mode=nat_mode,
+            relay_endpoint=relay_endpoint,
         )
         content_json = content_payload.model_dump_json() if hasattr(content_payload, "model_dump_json") else content_payload.json()
 
@@ -119,6 +123,10 @@ class NostrRelayClient:
             ["min_task_sats", str(pricing_specs.min_task_sats)],
             ["staked_sats", str(bond_status.staked_amount_sats)],
         ]
+        if nat_mode:
+            tags.append(["nat_mode", str(nat_mode)])
+        if relay_endpoint:
+            tags.append(["relay_endpoint", str(relay_endpoint)])
         if getattr(hardware_specs, "tee", False):
             tags.append(["tee", "true"])
         if getattr(hardware_specs, "tee_type", None):

@@ -14,9 +14,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 NODE_DIR = TESTS_DIR.parent
 ROOT_DIR = NODE_DIR.parent
 CONTRACTS_DIR = ROOT_DIR / "matrix-contracts"
+RELAY_DIR = ROOT_DIR / "matrix-compute-relay" / "src"
 SRC_DIR = NODE_DIR / "src"
 
-for p in [str(CONTRACTS_DIR), str(NODE_DIR), str(SRC_DIR)]:
+for p in [str(CONTRACTS_DIR), str(RELAY_DIR), str(NODE_DIR), str(SRC_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 

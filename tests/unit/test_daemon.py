@@ -10,9 +10,13 @@ from src.test_doubles.mock_settlement import MockSettlementService
 def test_worker_daemon_init_and_lifecycle():
     mock_relay = MockNostrRelay()
     mock_settlement = MockSettlementService()
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
     config = NodeConfig(
         p2p_host="127.0.0.1",
-        p2p_port=50099,
+        p2p_port=free_port,
         nostr_relays=["ws://127.0.0.1:8008"],
         settlement_api_url="http://127.0.0.1:8080",
     )

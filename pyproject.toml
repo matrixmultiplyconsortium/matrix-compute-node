@@ -60,4 +60,5 @@ asyncio_mode = "auto"
 pythonpath = [
     ".",
     "../matrix-contracts",
+    "../matrix-compute-relay/src",
 ]

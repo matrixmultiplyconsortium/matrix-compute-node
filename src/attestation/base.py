@@ -121,7 +121,7 @@ def get_attestation_provider(
     """
     norm_type = (provider_type or "auto").strip().lower()
 
-    if norm_type in ("auto", "nvidia-cca", "nvidia"):
+    if norm_type == "auto":
         from src.attestation.nvml_attest import NvidiaCcaProvider
 
         cca_provider = NvidiaCcaProvider(device_index=device_index, **kwargs)
@@ -131,7 +131,37 @@ def get_attestation_provider(
             )
             return cca_provider
 
-        if norm_type == "nvidia-cca" and not fallback_to_simulated:
+        try:
+            from src.attestation.sev_snp_attest import AmdSevSnpProvider
+
+            snp_provider = AmdSevSnpProvider(device_index=device_index, **kwargs)
+            if snp_provider.is_available():
+                logger.info("Using hardware attestation provider: amd-sev-snp")
+                return snp_provider
+        except Exception as exc:
+            logger.debug("Auto probe for amd-sev-snp failed: %s", exc)
+
+        if not fallback_to_simulated:
+            raise HardwareAttestationUnavailableError(
+                "No hardware TEE provider is operational (hardware attestation unavailable and fallback_to_simulated=False)."
+            )
+
+        logger.info("Hardware TEE unavailable; falling back to simulated-cca provider.")
+        from src.attestation.simulated import SimulatedAttestationProvider
+
+        return SimulatedAttestationProvider(**kwargs)
+
+    if norm_type in ("nvidia-cca", "nvidia"):
+        from src.attestation.nvml_attest import NvidiaCcaProvider
+
+        cca_provider = NvidiaCcaProvider(device_index=device_index, **kwargs)
+        if cca_provider.is_available():
+            logger.info(
+                "Using hardware attestation provider: nvidia-cca (device %d)", device_index
+            )
+            return cca_provider
+
+        if not fallback_to_simulated:
             raise HardwareAttestationUnavailableError(
                 f"NVIDIA CCA requested on device {device_index}, but hardware or CC mode is unavailable."
             )
@@ -140,6 +170,22 @@ def get_attestation_provider(
         from src.attestation.simulated import SimulatedAttestationProvider
 
         return SimulatedAttestationProvider(**kwargs)
+
+    if norm_type in ("amd-sev-snp", "amd", "sev-snp"):
+        from src.attestation.sev_snp_attest import AmdSevSnpProvider
+
+        snp_provider = AmdSevSnpProvider(device_index=device_index, **kwargs)
+        if snp_provider.is_available():
+            logger.info("Using hardware attestation provider: amd-sev-snp")
+            return snp_provider
+
+        if not fallback_to_simulated:
+            raise HardwareAttestationUnavailableError(
+                "AMD SEV-SNP requested, but /dev/sev-guest hardware is unavailable."
+            )
+
+        logger.info("Hardware AMD SEV-SNP unavailable; falling back to simulated SEV-SNP provider.")
+        return AmdSevSnpProvider(device_index=device_index, simulate=True, **kwargs)
 
     if norm_type in ("simulated-cca", "simulated", "mock"):
         from src.attestation.simulated import SimulatedAttestationProvider
@@ -151,3 +197,4 @@ def get_attestation_provider(
         return cls(device_index=device_index, **kwargs)
 
     raise ValueError(f"Unknown attestation provider type: '{provider_type}'")
+

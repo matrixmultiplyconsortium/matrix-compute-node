@@ -70,22 +70,37 @@ class WorkerDaemon:
             config=self.config,
         )
 
-        # 6. gRPC Server
-        self.server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=config.grpc_max_workers),
-            options=[
-                ("grpc.max_receive_message_length", config.grpc_max_message_bytes),
-                ("grpc.max_send_message_length", config.grpc_max_message_bytes),
-                ("grpc.keepalive_permit_without_calls", 1),
-                ("grpc.http2.min_ping_interval_without_data_ms", 5000),
-                ("grpc.http2.max_ping_strikes", 0),
-            ],
-        )
-        pb2_grpc.add_MatrixComputeServiceServicer_to_server(self.servicer, self.server)
-        bind_address = f"{config.p2p_host}:{config.p2p_port}"
-        self.server.add_insecure_port(bind_address)
+        # 6. Reverse Tunnel Client (for Outbound NAT Traversal)
+        self.tunnel_client = None
+        is_nat_mode = bool(config.enable_outbound_nat or config.nat_mode == "reverse_tunnel")
+        if is_nat_mode and config.relay_grpc_endpoint:
+            from src.p2p.tunnel_client import ReverseTunnelClient
+            self.tunnel_client = ReverseTunnelClient(
+                relay_endpoint=config.relay_grpc_endpoint,
+                signer=self.signer,
+                servicer=self.servicer,
+                heartbeat_interval_seconds=getattr(config, "tunnel_heartbeat_interval_seconds", 30.0),
+            )
 
-        # 7. Nostr Relay Client
+        # 7. gRPC Inbound Server (only bound if p2p_port > 0 or not outbound NAT)
+        self.server = None
+        self.bound_port = 0
+        if not (is_nat_mode and config.p2p_port == 0):
+            self.server = grpc.server(
+                futures.ThreadPoolExecutor(max_workers=config.grpc_max_workers),
+                options=[
+                    ("grpc.max_receive_message_length", config.grpc_max_message_bytes),
+                    ("grpc.max_send_message_length", config.grpc_max_message_bytes),
+                    ("grpc.keepalive_permit_without_calls", 1),
+                    ("grpc.http2.min_ping_interval_without_data_ms", 5000),
+                    ("grpc.http2.max_ping_strikes", 0),
+                ],
+            )
+            pb2_grpc.add_MatrixComputeServiceServicer_to_server(self.servicer, self.server)
+            bind_address = f"{config.p2p_host}:{config.p2p_port}"
+            self.bound_port = self.server.add_insecure_port(bind_address)
+
+        # 8. Nostr Relay Client
         self.nostr_client = nostr_client or NostrRelayClient(
             relays=config.nostr_relays,
             signer=self.signer,
@@ -104,9 +119,14 @@ class WorkerDaemon:
             f"({self.hardware_specs.vram_mb} MB VRAM, {self.hardware_specs.peak_fp32_tflops} TFLOPS)"
         )
 
-        # 2. Start gRPC server
-        self.server.start()
-        logger.info(f"P2P gRPC server listening on {self.config.p2p_host}:{self.config.p2p_port}")
+        # 2. Start gRPC server and/or reverse tunnel
+        if self.server is not None:
+            self.server.start()
+            logger.info(f"P2P gRPC server listening on {self.config.p2p_host}:{self.bound_port or self.config.p2p_port}")
+
+        if self.tunnel_client is not None:
+            self.tunnel_client.start()
+            logger.info(f"Reverse tunnel client started towards {self.config.relay_grpc_endpoint}")
 
         # 3. Announce to Nostr relays
         self._announce_once()
@@ -133,6 +153,8 @@ class WorkerDaemon:
                 bond_status=bond_status,
                 p2p_multiaddr=multiaddr,
                 lightning_pubkey=lightning_pubkey,
+                nat_mode=self.config.nat_mode,
+                relay_endpoint=self.config.relay_grpc_endpoint,
             )
             ok = self.nostr_client.publish_announce(event)
             if ok:
@@ -150,7 +172,10 @@ class WorkerDaemon:
         logger.info("Shutting down matrix-compute-node...")
         self.stop_event.set()
         self.nostr_client.disconnect()
-        self.server.stop(grace=grace)
+        if self.tunnel_client is not None:
+            self.tunnel_client.stop()
+        if self.server is not None:
+            self.server.stop(grace=grace)
         logger.info("Daemon stopped successfully")
 
     def run_forever(self) -> None:

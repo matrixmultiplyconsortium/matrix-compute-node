@@ -59,11 +59,21 @@ class NodeConfig(BaseModel):
     )
     attestation_provider: str = Field(
         "auto",
-        description="Attestation provider: 'auto', 'nvidia-cca', 'simulated-cca', 'none'",
+        description="Attestation provider: 'auto', 'nvidia-cca', 'amd-sev-snp', 'simulated-cca', 'none'",
     )
     inject_fraud: bool = Field(
         False,
         description="Stage 03 fault-injection flag: intentionally perturbs GEMM output to test Freivalds & HODL cancellation",
+    )
+    nat_mode: str = Field("direct", description="NAT traversal mode: 'direct' or 'reverse_tunnel'")
+    relay_grpc_endpoint: Optional[str] = Field(
+        None, description="gRPC endpoint of relay for reverse tunnel (host:port)"
+    )
+    enable_outbound_nat: bool = Field(
+        False, description="Enable outbound-only reverse tunnel to relay"
+    )
+    tunnel_heartbeat_interval_seconds: float = Field(
+        30.0, description="Heartbeat interval in seconds for reverse tunnel"
     )
 
     @model_validator(mode="before")
@@ -124,6 +134,21 @@ class NodeConfig(BaseModel):
                 "MATRIX_INJECT_FRAUD",
                 "INJECT_FRAUD",
             ],
+            "nat_mode": ["MATRIX_NAT_MODE", "NAT_MODE"],
+            "relay_grpc_endpoint": [
+                "MATRIX_RELAY_GRPC_ENDPOINT",
+                "RELAY_GRPC_ENDPOINT",
+                "MATRIX_RELAY_ENDPOINT",
+                "RELAY_ENDPOINT",
+            ],
+            "enable_outbound_nat": [
+                "MATRIX_ENABLE_OUTBOUND_NAT",
+                "ENABLE_OUTBOUND_NAT",
+            ],
+            "tunnel_heartbeat_interval_seconds": [
+                "MATRIX_TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
+                "TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
+            ],
         }
 
         enriched = dict(data)
@@ -152,15 +177,31 @@ class NodeConfig(BaseModel):
         if "inject_fraud" in enriched and isinstance(enriched["inject_fraud"], str):
             enriched["inject_fraud"] = enriched["inject_fraud"].strip().lower() in ("1", "true", "yes", "on")
 
+        if "enable_outbound_nat" in enriched and isinstance(enriched["enable_outbound_nat"], str):
+            enriched["enable_outbound_nat"] = enriched["enable_outbound_nat"].strip().lower() in ("1", "true", "yes", "on")
+
+        if "tunnel_heartbeat_interval_seconds" in enriched and enriched["tunnel_heartbeat_interval_seconds"] is not None:
+            enriched["tunnel_heartbeat_interval_seconds"] = float(enriched["tunnel_heartbeat_interval_seconds"])
+
+        if enriched.get("enable_outbound_nat") and enriched.get("nat_mode") in (None, "direct", ""):
+            enriched["nat_mode"] = "reverse_tunnel"
+
         return enriched
 
     @field_validator("p2p_port")
     @classmethod
     def validate_port(cls, v: Any) -> int:
         port = int(v)
-        if not (1 <= port <= 65535):
-            raise ValueError(f"p2p_port must be between 1 and 65535, got {port}")
+        if not (0 <= port <= 65535):
+            raise ValueError(f"p2p_port must be between 0 and 65535, got {port}")
         return port
+
+    @model_validator(mode="after")
+    def validate_port_mode(self) -> "NodeConfig":
+        is_nat = bool(self.enable_outbound_nat or self.nat_mode == "reverse_tunnel")
+        if not is_nat and self.p2p_port == 0:
+            raise ValueError("p2p_port must be between 1 and 65535 when nat_mode is direct, got 0")
+        return self
 
     @field_validator("dtype_preference")
     @classmethod
@@ -213,6 +254,15 @@ class NodeConfig(BaseModel):
         return clean
 
     @property
+    def worker_pubkey_hex(self) -> str:
+        """Derives 33-byte compressed Secp256k1 public key from worker_privkey_hex."""
+        try:
+            from src.crypto.signer import WorkerSigner
+            return WorkerSigner(self.worker_privkey_hex).get_pubkey_hex()
+        except Exception:
+            return ""
+
+    @property
     def effective_p2p_multiaddr(self) -> str:
         """Returns explicit multiaddr or derives /ip4/{host}/tcp/{port}."""
         if self.p2p_multiaddr:
@@ -223,15 +273,33 @@ class NodeConfig(BaseModel):
         """
         Resolves a routable multiaddr for Nostr Kind 30000 announcements.
         1. Uses explicit p2p_multiaddr if configured.
-        2. Auto-detects cloud GPU port-mapping env vars (Vast.ai / RunPod):
+        2. Outbound NAT / Reverse Tunnel mode: constructs circuit multiaddr via relay.
+        3. Auto-detects cloud GPU port-mapping env vars (Vast.ai / RunPod):
            - Vast.ai: PUBLIC_IPADDR + VAST_TCP_PORT_{p2p_port}
            - RunPod:  RUNPOD_PUBLIC_IP + RUNPOD_TCP_PORT_{p2p_port}
-        3. Uses /ip4/{p2p_host}/tcp/{p2p_port} if p2p_host is not a wildcard (0.0.0.0 / ::).
-        4. Otherwise probes outbound interface towards settlement_api_url or Nostr relay,
+        4. Uses /ip4/{p2p_host}/tcp/{p2p_port} if p2p_host is not a wildcard (0.0.0.0 / ::).
+        5. Otherwise probes outbound interface towards settlement_api_url or Nostr relay,
            falling back to 127.0.0.1.
         """
         if self.p2p_multiaddr:
             return self.p2p_multiaddr
+
+        # Outbound NAT / Reverse Tunnel mode
+        if self.enable_outbound_nat or self.nat_mode == "reverse_tunnel":
+            if self.relay_grpc_endpoint:
+                clean_relay = self.relay_grpc_endpoint.strip()
+                pubkey = self.worker_pubkey_hex
+                if clean_relay.startswith("/"):
+                    if "p2p-circuit" in clean_relay:
+                        return clean_relay
+                    return f"{clean_relay}/p2p-circuit/p2p/{pubkey}" if pubkey else f"{clean_relay}/p2p-circuit"
+                else:
+                    if ":" in clean_relay:
+                        host, port_str = clean_relay.split(":", 1)
+                    else:
+                        host, port_str = clean_relay, "9090"
+                    proto = "ip4" if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else "dns4"
+                    return f"/{proto}/{host}/tcp/{port_str}/p2p-circuit/p2p/{pubkey}" if pubkey else f"/{proto}/{host}/tcp/{port_str}/p2p-circuit"
 
         environ = os.environ if env is None else env
         # Vast.ai external TCP port mapping detection
@@ -334,6 +402,21 @@ class NodeConfig(BaseModel):
                 "MATRIX_INJECT_FRAUD",
                 "INJECT_FRAUD",
             ],
+            "nat_mode": ["MATRIX_NAT_MODE", "NAT_MODE"],
+            "relay_grpc_endpoint": [
+                "MATRIX_RELAY_GRPC_ENDPOINT",
+                "RELAY_GRPC_ENDPOINT",
+                "MATRIX_RELAY_ENDPOINT",
+                "RELAY_ENDPOINT",
+            ],
+            "enable_outbound_nat": [
+                "MATRIX_ENABLE_OUTBOUND_NAT",
+                "ENABLE_OUTBOUND_NAT",
+            ],
+            "tunnel_heartbeat_interval_seconds": [
+                "MATRIX_TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
+                "TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
+            ],
         }.items():
             for env_var in env_vars:
                 if env_var in environ and environ[env_var] != "":
@@ -362,6 +445,12 @@ class NodeConfig(BaseModel):
             data["enable_confidential_compute"] = data["enable_confidential_compute"].strip().lower() in ("1", "true", "yes")
         if "inject_fraud" in data and isinstance(data["inject_fraud"], str):
             data["inject_fraud"] = data["inject_fraud"].strip().lower() in ("1", "true", "yes", "on")
+        if "enable_outbound_nat" in data and isinstance(data["enable_outbound_nat"], str):
+            data["enable_outbound_nat"] = data["enable_outbound_nat"].strip().lower() in ("1", "true", "yes", "on")
+        if "tunnel_heartbeat_interval_seconds" in data and data["tunnel_heartbeat_interval_seconds"] is not None:
+            data["tunnel_heartbeat_interval_seconds"] = float(data["tunnel_heartbeat_interval_seconds"])
+        if data.get("enable_outbound_nat") and data.get("nat_mode") in (None, "direct", ""):
+            data["nat_mode"] = "reverse_tunnel"
 
         return cls(**data)
 
@@ -492,7 +581,7 @@ class NodeConfig(BaseModel):
             dest="attestation_provider",
             type=str,
             default=None,
-            help="Attestation provider ('auto', 'nvidia-cca', 'simulated-cca', 'none')",
+            help="Attestation provider ('auto', 'nvidia-cca', 'amd-sev-snp', 'simulated-cca', 'none')",
         )
         parser.add_argument(
             "--inject-fraud",
@@ -500,6 +589,35 @@ class NodeConfig(BaseModel):
             action=argparse.BooleanOptionalAction if hasattr(argparse, "BooleanOptionalAction") else "store_true",
             default=None,
             help="Intentionally perturb GEMM output for Scenario 3 invalidation drills",
+        )
+        parser.add_argument(
+            "--nat-mode",
+            dest="nat_mode",
+            type=str,
+            default=None,
+            help="NAT traversal mode ('direct', 'reverse_tunnel')",
+        )
+        parser.add_argument(
+            "--relay-grpc-endpoint",
+            "--relay-endpoint",
+            dest="relay_grpc_endpoint",
+            type=str,
+            default=None,
+            help="Relay gRPC endpoint for reverse tunnel (host:port)",
+        )
+        parser.add_argument(
+            "--enable-outbound-nat",
+            dest="enable_outbound_nat",
+            action=argparse.BooleanOptionalAction if hasattr(argparse, "BooleanOptionalAction") else "store_true",
+            default=None,
+            help="Enable outbound-only reverse tunnel to relay",
+        )
+        parser.add_argument(
+            "--tunnel-heartbeat-interval-seconds",
+            dest="tunnel_heartbeat_interval_seconds",
+            type=float,
+            default=None,
+            help="Heartbeat interval in seconds for reverse tunnel",
         )
         return parser
 
@@ -529,6 +647,8 @@ class NodeConfig(BaseModel):
                 cli_dict["nostr_relays"] = [r.strip() for r in raw.split(",") if r.strip()]
 
         merged = {**base_config, **cli_dict}
+        if merged.get("enable_outbound_nat") and merged.get("nat_mode") in (None, "direct", ""):
+            merged["nat_mode"] = "reverse_tunnel"
         return cls(**merged)
 
     # Alias for backwards-compatibility and CLI invocations
