@@ -1,5 +1,7 @@
 # matrix-compute-node
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matrix-compute/matrix-compute-colab/blob/main/01_quickstart_distributed_matmul.ipynb)
+
 Decentralized worker daemon for the Distributed Matrix Multiplication network.
 
 ## Overview
