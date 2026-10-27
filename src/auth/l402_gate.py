@@ -35,6 +35,8 @@ class L402PreAllocationGate:
         cache_ttl_seconds: float = 300.0,
         max_cache_size: int = 10000,
         cache_ttl: Optional[float] = None,
+        is_seed_worker: bool = False,
+        worker_pubkey: Optional[str] = None,
     ) -> None:
         self.settlement_client = settlement_client_or_url
         self.verification_key = verification_key
@@ -42,6 +44,8 @@ class L402PreAllocationGate:
         self.min_task_sats = int(min_task_sats)
         self.cache_ttl_seconds = float(cache_ttl if cache_ttl is not None else cache_ttl_seconds)
         self.max_cache_size = int(max_cache_size)
+        self.is_seed_worker = bool(is_seed_worker)
+        self.worker_pubkey = str(worker_pubkey).strip() if worker_pubkey else None
 
         self._lock = threading.RLock()
         # payment_hash -> (status, expires_at)
@@ -160,6 +164,12 @@ class L402PreAllocationGate:
             return None, None
 
         cleaned = auth_header.strip()
+        if cleaned.startswith("mc_trial_"):
+            if ":" in cleaned:
+                parts_c = cleaned.split(":", 1)
+                return parts_c[0].strip(), parts_c[1].strip() or ("0" * 64)
+            return cleaned, "0" * 64
+
         if cleaned.lower().startswith("authorization:"):
             cleaned = cleaned[14:].strip()
         parts = cleaned.split(" ", 1)
@@ -169,6 +179,9 @@ class L402PreAllocationGate:
         scheme, credentials = parts[0].upper(), parts[1].strip()
         if scheme not in ("L402", "LSAT"):
             return None, None
+
+        if credentials.startswith("mc_trial_") and ":" not in credentials:
+            return credentials, "0" * 64
 
         # Credentials expected format: <macaroon_b64>:<payment_hash>
         cred_parts = credentials.split(":", 1)
@@ -224,6 +237,121 @@ class L402PreAllocationGate:
 
         return status, None
 
+    def mint_trial_macaroon(
+        self,
+        task_id: str,
+        job_id: str = "",
+        seed_worker_pubkeys: Optional[List[str]] = None,
+        allowed_workers: Optional[List[str]] = None,
+        max_matrix_dim: int = 4096,
+        expiry_seconds: int = 3600,
+    ) -> str:
+        """
+        Mints a trial macaroon (`mc_trial_<base64>`) bound to `seed_worker_pubkeys` and `max_matrix_dim`.
+        """
+        workers_raw = allowed_workers if allowed_workers is not None else (seed_worker_pubkeys or [])
+        now = int(time.time())
+        expires_at = now + int(expiry_seconds)
+        payload_dict: Dict[str, Any] = {
+            "tier": "FREE_TRIAL",
+            "task_id": str(task_id).strip(),
+            "job_id": str(job_id or task_id).strip(),
+            "allowed_workers": sorted(list({str(w).strip() for w in workers_raw if str(w).strip()})),
+            "max_matrix_dim": int(max_matrix_dim),
+            "locked_sats": 0,
+            "expires_at": expires_at,
+            "created_at": now,
+        }
+        canonical_str = json.dumps(payload_dict, sort_keys=True, separators=(",", ":"))
+        sig = hmac.new(
+            self.verification_key.encode("utf-8"),
+            canonical_str.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        payload_dict["sig"] = sig
+        raw_json = json.dumps(payload_dict, separators=(",", ":"))
+        b64 = base64.urlsafe_b64encode(raw_json.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"mc_trial_{b64}"
+
+    def verify_trial_macaroon(
+        self,
+        token: str,
+        worker_pubkey: Optional[str] = None,
+        m: int = 1,
+        k: int = 1,
+        n: int = 1,
+        current_time: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Verifies a `mc_trial_<base64>` macaroon token.
+        Returns `(is_authorized, reason)`.
+        """
+        if not isinstance(token, str) or not token.strip().startswith("mc_trial_"):
+            return False, "INVALID_TOKEN_PREFIX"
+
+        b64_part = token.strip()[len("mc_trial_") :]
+        if not b64_part:
+            return False, "MALFORMED_MACAROON_PAYLOAD: empty payload"
+
+        rem = len(b64_part) % 4
+        if rem > 0:
+            b64_part += "=" * (4 - rem)
+
+        try:
+            if "-" in b64_part or "_" in b64_part:
+                raw_bytes = base64.urlsafe_b64decode(b64_part.encode("ascii"))
+            else:
+                raw_bytes = base64.b64decode(b64_part.encode("ascii"))
+            data = json.loads(raw_bytes.decode("utf-8"))
+        except Exception as ex:
+            return False, f"MALFORMED_MACAROON_PAYLOAD: {ex}"
+
+        if not isinstance(data, dict):
+            return False, "MALFORMED_MACAROON_PAYLOAD: not a JSON object"
+
+        if "caveats" in data and isinstance(data["caveats"], dict):
+            caveats = dict(data["caveats"])
+            sig = data.get("signature")
+            canonical_str = json.dumps(caveats, sort_keys=True)
+        else:
+            caveats = dict(data)
+            sig = caveats.pop("sig", None)
+            canonical_str = json.dumps(caveats, sort_keys=True, separators=(",", ":"))
+
+        if not sig or not isinstance(sig, str):
+            return False, "MISSING_SIGNATURE"
+
+        expected_sig = hmac.new(
+            self.verification_key.encode("utf-8"),
+            canonical_str.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(sig, expected_sig):
+            return False, "SIGNATURE_VERIFICATION_FAILED"
+
+        now = float(current_time if current_time is not None else time.time())
+        exp = caveats.get("expires_at") if "expires_at" in caveats else caveats.get("expiry", 0)
+        if not isinstance(exp, (int, float)) or now > float(exp):
+            return False, "TOKEN_EXPIRED"
+
+        eff_worker = worker_pubkey if worker_pubkey is not None else self.worker_pubkey
+        allowed_workers = caveats.get("allowed_workers", [])
+        if eff_worker is not None:
+            clean_w = str(eff_worker).strip().lower()
+            if not isinstance(allowed_workers, list) or not any(
+                hmac.compare_digest(clean_w, str(w).strip().lower()) for w in allowed_workers
+            ):
+                return False, "PERMISSION_DENIED: Trial macaroon not authorized on third-party worker"
+        elif not self.is_seed_worker:
+            return False, "PERMISSION_DENIED: Trial macaroon not authorized on third-party worker"
+
+        max_dim = int(caveats.get("max_matrix_dim", 4096))
+        if max(int(m), int(k), int(n)) > max_dim:
+            return False, f"PERMISSION_DENIED: Trial macaroon dimension exceeds {max_dim} cap"
+
+        return True, "AUTHORIZED"
+
     def verify_token(
         self,
         auth_header: str,
@@ -233,6 +361,7 @@ class L402PreAllocationGate:
         n: int = 1,
         current_time: Optional[float] = None,
         x_task_id: Optional[str] = None,
+        worker_pubkey: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Executes the 5-Step Pre-Allocation Validation Gate:
@@ -251,6 +380,21 @@ class L402PreAllocationGate:
             return False, "Missing or malformed L402 Authorization header", "UNAUTHENTICATED"
 
         clean_payment_hash = payment_hash.strip().lower()
+
+        # Fast-path for Zero-Drain Trial Macaroons (`mc_trial_<base64>`)
+        if macaroon_b64.startswith("mc_trial_"):
+            ok, reason = self.verify_trial_macaroon(
+                token=macaroon_b64,
+                worker_pubkey=worker_pubkey,
+                m=m,
+                k=k,
+                n=n,
+                current_time=current_time,
+            )
+            if not ok:
+                err_code = "PERMISSION_DENIED" if "PERMISSION_DENIED" in reason else "UNAUTHENTICATED"
+                return False, reason, err_code
+            return True, None, "AUTHORIZED"
 
         # Step 2: Decode & HMAC Verification
         try:

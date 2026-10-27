@@ -13,9 +13,11 @@ import grpc
 import numpy as np
 
 from matrix_contracts.v1 import pb2, pb2_grpc
+from src.auth.hashcash import HashcashVerifier
 from src.auth.l402_gate import L402PreAllocationGate
 from src.crypto.signer import WorkerSigner
 from src.engine.compute_core import ComputeEngine
+from src.engine.scheduler import PreemptiveComputeScheduler, PriorityTier
 from src.engine.enclave_compute import (
     EnclaveComputeCore,
     EnclaveDecryptionError,
@@ -113,11 +115,17 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         attestation_provider: Optional[BaseAttestationProvider] = None,
         enclave_core: Optional[EnclaveComputeCore] = None,
         session_manager: Optional[SessionManager] = None,
+        scheduler: Optional[PreemptiveComputeScheduler] = None,
+        hashcash_verifier: Optional[HashcashVerifier] = None,
     ) -> None:
         self.signer = signer
         self.gate = gate
         self.engine = engine or ComputeEngine()
         self.config = config
+        self.scheduler = scheduler or PreemptiveComputeScheduler()
+        self.hashcash_verifier = hashcash_verifier or HashcashVerifier(
+            min_bits=getattr(config, "trial_pow_bits", 12) if config else 12
+        )
         self.enclave_core = enclave_core or EnclaveComputeCore(
             compute_engine=self.engine,
             max_sessions=1000,
@@ -333,10 +341,12 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         # 1. Extract Authorization header and metadata from invocation metadata (case-insensitive)
         auth_header = ""
         meta_task_id = None
+        hashcash_stamp = None
         if context is not None:
             metadata_dict = {str(k).lower(): str(v) for k, v in context.invocation_metadata()}
             auth_header = metadata_dict.get("authorization") or metadata_dict.get("authorization-bin") or ""
             meta_task_id = metadata_dict.get("x-task-id")
+            hashcash_stamp = metadata_dict.get("x-hashcash-stamp") or metadata_dict.get("x-hashcash")
 
         # 2. Strict Pre-Allocation Gate:
         # Check authorization and token BEFORE allocating VRAM or processing streams
@@ -347,15 +357,25 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
         if not macaroon_b64 or not payment_hash:
             self._abort(context, grpc.StatusCode.UNAUTHENTICATED, "Malformed L402 Authorization header")
 
+        is_trial = macaroon_b64.startswith("mc_trial_")
+
         # Extract task_id from metadata or macaroon caveats
         task_id = meta_task_id
         if not task_id:
             try:
                 import base64
                 import json
-                raw_bytes = base64.b64decode(macaroon_b64)
+                b64_clean = macaroon_b64[len("mc_trial_") :] if is_trial else macaroon_b64
+                rem = len(b64_clean) % 4
+                if rem:
+                    b64_clean += "=" * (4 - rem)
+                raw_bytes = (
+                    base64.urlsafe_b64decode(b64_clean.encode("ascii"))
+                    if ("-" in b64_clean or "_" in b64_clean)
+                    else base64.b64decode(b64_clean)
+                )
                 payload = json.loads(raw_bytes.decode("utf-8"))
-                caveats = payload.get("caveats", {})
+                caveats = payload.get("caveats", payload) if isinstance(payload, dict) else {}
                 task_ids = caveats.get("task_ids") or caveats.get("task_batch") or caveats.get("tasks")
                 if task_ids and isinstance(task_ids, list):
                     if len(task_ids) == 1:
@@ -390,6 +410,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
             dtype = task_info["dtype"] if task_info else "fp32"
 
             # Execute 5-step gate verification BEFORE allocating memory
+            node_pubkey = self.signer.get_pubkey_hex() if (is_trial and self.signer is not None) else None
             ok, err_msg, err_code = self.gate.verify_token(
                 auth_header=auth_header,
                 task_id=task_id,
@@ -397,6 +418,7 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 k=k,
                 n=n,
                 x_task_id=meta_task_id,
+                worker_pubkey=node_pubkey,
             )
             if not ok:
                 status = grpc.StatusCode.UNAUTHENTICATED
@@ -405,6 +427,25 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 elif err_code == "FAILED_PRECONDITION":
                     status = grpc.StatusCode.FAILED_PRECONDITION
                 self._abort(context, status, err_msg or "L402 Pre-allocation check failed")
+
+            if is_trial and (hashcash_stamp is not None or bool(getattr(self.config, "require_trial_hashcash", False))):
+                if not hashcash_stamp:
+                    self._abort(
+                        context,
+                        grpc.StatusCode.UNAUTHENTICATED,
+                        "Missing required x-hashcash-stamp metadata for FREE_TRIAL execution",
+                    )
+                pow_ok, pow_reason = self.hashcash_verifier.verify_and_consume(
+                    stamp=hashcash_stamp,
+                    expected_resource=task_id,
+                )
+                if not pow_ok:
+                    pow_status = (
+                        grpc.StatusCode.PERMISSION_DENIED
+                        if pow_reason == "REPLAYED_HASHCASH_STAMP"
+                        else grpc.StatusCode.UNAUTHENTICATED
+                    )
+                    self._abort(context, pow_status, f"Invalid Hashcash proof-of-work: {pow_reason}")
 
             if not task_info:
                 self._abort(
@@ -436,16 +477,22 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 except (EnclaveDecryptionError, EnclaveFramingError) as exc:
                     self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
-            # Finalize and execute in-enclave GEMM, encrypt output
+            # Finalize and execute in-enclave GEMM via PreemptiveComputeScheduler, encrypt output
             should_inject_fraud = bool(getattr(self.config, "inject_fraud", False))
+            tier = PriorityTier.FREE_TRIAL if is_trial else PriorityTier.PAID_MAINNET
             try:
-                result_bytes, iv, tag, is_encrypted, exec_time_ms = session.execute_and_encrypt(
-                    inject_fraud=should_inject_fraud
+                result_bytes, iv, tag, is_encrypted, exec_time_ms = self.scheduler.execute(
+                    tier,
+                    lambda: session.execute_and_encrypt(inject_fraud=should_inject_fraud),
                 )
             except EnclaveExecutionError as exc:
                 self._abort(context, grpc.StatusCode.INTERNAL, str(exc))
             except EnclaveFramingError as exc:
                 self._abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            except RuntimeError as exc:
+                if is_trial and "Trial execution throttled" in str(exc):
+                    self._abort(context, grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+                raise
 
             # Cryptographic digest and signing
             c_hash = hashlib.sha256(result_bytes).hexdigest()

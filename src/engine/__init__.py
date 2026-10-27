@@ -1,6 +1,7 @@
 """Compute engine subsystem."""
 
 from src.engine.compute_core import ComputeEngine
+from src.engine.scheduler import PreemptiveComputeScheduler, PriorityTier
 from src.engine.enclave_compute import (
     EnclaveComputeCore,
     EnclaveDecryptionError,
@@ -23,6 +24,8 @@ from src.engine.enclave_compute import (
 
 __all__ = [
     "ComputeEngine",
+    "PreemptiveComputeScheduler",
+    "PriorityTier",
     "EnclaveComputeCore",
     "EnclaveSession",
     "EnclaveError",

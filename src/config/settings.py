@@ -47,7 +47,7 @@ class NodeConfig(BaseModel):
     dtype_preference: str = Field("fp32", description="Compute precision preference")
     log_level: str = "INFO"
     grpc_max_workers: int = 10
-    grpc_max_message_bytes: int = 100 * 1024 * 1024  # 100 MB
+    grpc_max_message_bytes: int = 512 * 1024 * 1024  # 512 MB
     l402_cache_ttl_seconds: float = Field(
         300.0, description="TTL in seconds for cached HELD invoice verifications in L402 gate"
     )
@@ -77,6 +77,12 @@ class NodeConfig(BaseModel):
     )
     d_tag: str = Field(
         "matrix-compute-worker", description="Nostr replaceable event d-tag identifier"
+    )
+    is_seed_worker: bool = Field(
+        False, description="Whether this node is an authorized platform seed worker for FREE_TRIAL tasks"
+    )
+    trial_pow_bits: int = Field(
+        20, description="Minimum Hashcash PoW leading zero bits required for FREE_TRIAL tasks"
     )
 
     @model_validator(mode="before")
@@ -152,6 +158,16 @@ class NodeConfig(BaseModel):
                 "MATRIX_TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
                 "TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
             ],
+            "is_seed_worker": [
+                "MATRIX_IS_SEED_WORKER",
+                "MATRIX_WORKER_IS_SEED_WORKER",
+                "IS_SEED_WORKER",
+            ],
+            "trial_pow_bits": [
+                "MATRIX_TRIAL_POW_BITS",
+                "MATRIX_WORKER_TRIAL_POW_BITS",
+                "TRIAL_POW_BITS",
+            ],
         }
 
         enriched = dict(data)
@@ -182,6 +198,12 @@ class NodeConfig(BaseModel):
 
         if "enable_outbound_nat" in enriched and isinstance(enriched["enable_outbound_nat"], str):
             enriched["enable_outbound_nat"] = enriched["enable_outbound_nat"].strip().lower() in ("1", "true", "yes", "on")
+
+        if "is_seed_worker" in enriched and isinstance(enriched["is_seed_worker"], str):
+            enriched["is_seed_worker"] = enriched["is_seed_worker"].strip().lower() in ("1", "true", "yes", "on")
+
+        if "trial_pow_bits" in enriched and enriched["trial_pow_bits"] is not None:
+            enriched["trial_pow_bits"] = int(enriched["trial_pow_bits"])
 
         if "tunnel_heartbeat_interval_seconds" in enriched and enriched["tunnel_heartbeat_interval_seconds"] is not None:
             enriched["tunnel_heartbeat_interval_seconds"] = float(enriched["tunnel_heartbeat_interval_seconds"])
@@ -426,6 +448,16 @@ class NodeConfig(BaseModel):
             "tunnel_heartbeat_interval_seconds": [
                 "MATRIX_TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
                 "TUNNEL_HEARTBEAT_INTERVAL_SECONDS",
+            ],
+            "is_seed_worker": [
+                "MATRIX_IS_SEED_WORKER",
+                "MATRIX_WORKER_IS_SEED_WORKER",
+                "IS_SEED_WORKER",
+            ],
+            "trial_pow_bits": [
+                "MATRIX_TRIAL_POW_BITS",
+                "MATRIX_WORKER_TRIAL_POW_BITS",
+                "TRIAL_POW_BITS",
             ],
         }.items():
             for env_var in env_vars:
