@@ -141,6 +141,16 @@ def get_attestation_provider(
         except Exception as exc:
             logger.debug("Auto probe for amd-sev-snp failed: %s", exc)
 
+        try:
+            from src.attestation.tdx_attest import IntelTdxProvider
+
+            tdx_provider = IntelTdxProvider(device_index=device_index, **kwargs)
+            if tdx_provider.is_available():
+                logger.info("Using hardware attestation provider: intel-tdx")
+                return tdx_provider
+        except Exception as exc:
+            logger.debug("Auto probe for intel-tdx failed: %s", exc)
+
         if not fallback_to_simulated:
             raise HardwareAttestationUnavailableError(
                 "No hardware TEE provider is operational (hardware attestation unavailable and fallback_to_simulated=False)."
@@ -186,6 +196,22 @@ def get_attestation_provider(
 
         logger.info("Hardware AMD SEV-SNP unavailable; falling back to simulated SEV-SNP provider.")
         return AmdSevSnpProvider(device_index=device_index, simulate=True, **kwargs)
+
+    if norm_type in ("intel-tdx", "tdx", "intel"):
+        from src.attestation.tdx_attest import IntelTdxProvider
+
+        tdx_provider = IntelTdxProvider(device_index=device_index, **kwargs)
+        if tdx_provider.is_available():
+            logger.info("Using hardware attestation provider: intel-tdx")
+            return tdx_provider
+
+        if not fallback_to_simulated:
+            raise HardwareAttestationUnavailableError(
+                "Intel TDX requested, but /dev/tdx_guest hardware is unavailable."
+            )
+
+        logger.info("Hardware Intel TDX unavailable; falling back to simulated TDX provider.")
+        return IntelTdxProvider(device_index=device_index, simulate=True, **kwargs)
 
     if norm_type in ("simulated-cca", "simulated", "mock"):
         from src.attestation.simulated import SimulatedAttestationProvider

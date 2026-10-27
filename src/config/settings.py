@@ -59,7 +59,7 @@ class NodeConfig(BaseModel):
     )
     attestation_provider: str = Field(
         "auto",
-        description="Attestation provider: 'auto', 'nvidia-cca', 'amd-sev-snp', 'simulated-cca', 'none'",
+        description="Attestation provider: 'auto', 'nvidia-cca', 'amd-sev-snp', 'intel-tdx', 'simulated-cca', 'none'",
     )
     inject_fraud: bool = Field(
         False,
@@ -74,6 +74,9 @@ class NodeConfig(BaseModel):
     )
     tunnel_heartbeat_interval_seconds: float = Field(
         30.0, description="Heartbeat interval in seconds for reverse tunnel"
+    )
+    d_tag: str = Field(
+        "matrix-compute-worker", description="Nostr replaceable event d-tag identifier"
     )
 
     @model_validator(mode="before")
@@ -202,6 +205,13 @@ class NodeConfig(BaseModel):
         if not is_nat and self.p2p_port == 0:
             raise ValueError("p2p_port must be between 1 and 65535 when nat_mode is direct, got 0")
         return self
+
+    @field_validator("attestation_provider")
+    @classmethod
+    def validate_attestation_provider(cls, v: Any) -> str:
+        if v is None:
+            return "auto"
+        return str(v).strip().lower()
 
     @field_validator("dtype_preference")
     @classmethod
@@ -581,7 +591,7 @@ class NodeConfig(BaseModel):
             dest="attestation_provider",
             type=str,
             default=None,
-            help="Attestation provider ('auto', 'nvidia-cca', 'amd-sev-snp', 'simulated-cca', 'none')",
+            help="Attestation provider ('auto', 'nvidia-cca', 'amd-sev-snp', 'intel-tdx', 'simulated-cca', 'none')",
         )
         parser.add_argument(
             "--inject-fraud",

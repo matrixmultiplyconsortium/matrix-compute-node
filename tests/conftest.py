@@ -9,15 +9,16 @@ from pathlib import Path
 import pytest
 import numpy as np
 
-# Ensure matrix-contracts and matrix-compute-node are on sys.path
+# Ensure matrix-contracts, matrix-compute-sdk, and matrix-compute-node are on sys.path
 TESTS_DIR = Path(__file__).resolve().parent
 NODE_DIR = TESTS_DIR.parent
 ROOT_DIR = NODE_DIR.parent
 CONTRACTS_DIR = ROOT_DIR / "matrix-contracts"
 RELAY_DIR = ROOT_DIR / "matrix-compute-relay" / "src"
+SDK_DIR = ROOT_DIR / "matrix-compute-sdk" / "src"
 SRC_DIR = NODE_DIR / "src"
 
-for p in [str(CONTRACTS_DIR), str(RELAY_DIR), str(NODE_DIR), str(SRC_DIR)]:
+for p in [str(CONTRACTS_DIR), str(RELAY_DIR), str(SDK_DIR), str(NODE_DIR), str(SRC_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 

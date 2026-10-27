@@ -153,6 +153,7 @@ class WorkerDaemon:
                 bond_status=bond_status,
                 p2p_multiaddr=multiaddr,
                 lightning_pubkey=lightning_pubkey,
+                d_tag=self.config.d_tag,
                 nat_mode=self.config.nat_mode,
                 relay_endpoint=self.config.relay_grpc_endpoint,
             )

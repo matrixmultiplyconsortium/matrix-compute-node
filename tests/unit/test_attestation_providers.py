@@ -28,6 +28,8 @@ from src.attestation import (
     AttestationValidationError,
     BaseAttestationProvider,
     HardwareAttestationUnavailableError,
+    INTEL_TDX_GOLDEN_RIM,
+    IntelTdxProvider,
     NvidiaCcaProvider,
     SNP_GET_EXT_REPORT,
     SNP_GET_REPORT,
@@ -670,4 +672,86 @@ def test_amd_sev_snp_servicer_handshake() -> None:
     worker_pubkey_hash = hashlib.sha256(ack.worker_ephemeral_pubkey).hexdigest()
     assert ev.token_claims["ephemeral_pubkey_hash"] == worker_pubkey_hash
     assert len(ev.evidence_blob) == 1184
+
+
+# =============================================================================
+# INTEL TDX HARDWARE ATTESTATION PROVIDER TESTS (Milestone 3)
+# =============================================================================
+
+def test_intel_tdx_factory_resolution() -> None:
+    """Tests get_attestation_provider factory resolution for Intel TDX."""
+    # Canonical
+    p1 = get_attestation_provider("intel-tdx", simulate=True)
+    assert isinstance(p1, IntelTdxProvider)
+    assert p1.provider_name == "intel-tdx"
+    assert p1.is_available() is True
+
+    # Aliases
+    p2 = get_attestation_provider("tdx", simulate=True)
+    assert isinstance(p2, IntelTdxProvider)
+    p3 = get_attestation_provider("intel", simulate=True)
+    assert isinstance(p3, IntelTdxProvider)
+
+    # Fallback behavior when hardware is absent
+    with patch.object(IntelTdxProvider, "is_available", return_value=False):
+        with pytest.raises(HardwareAttestationUnavailableError):
+            get_attestation_provider("intel-tdx", fallback_to_simulated=False)
+
+        p_fallback = get_attestation_provider("intel-tdx", fallback_to_simulated=True)
+        assert isinstance(p_fallback, IntelTdxProvider)
+        assert getattr(p_fallback, "simulate", False) is True
+
+
+def test_intel_tdx_evidence_generation_valid() -> None:
+    """Verifies that IntelTdxProvider generates authentic DCAP Quote and AttestationEvidence."""
+    provider = IntelTdxProvider(simulate=True)
+    nonce = secrets.token_bytes(32)
+    pubkey = secrets.token_bytes(32)
+
+    evidence = provider.generate_evidence(nonce=nonce, public_key=pubkey)
+
+    assert isinstance(evidence, AttestationEvidence)
+    assert evidence.provider == "intel-tdx"
+    assert len(evidence.evidence_blob) >= 636
+    assert len(evidence.certificate_chain) == 3
+
+    # Binding assertions
+    pubkey_hash = hashlib.sha256(pubkey).digest()
+    assert evidence.token_claims["nonce"] == nonce.hex()
+    assert evidence.token_claims["ephemeral_pubkey_hash"] == pubkey_hash.hex()
+    assert evidence.token_claims["debug"] is False
+
+
+def test_intel_tdx_servicer_handshake() -> None:
+    """Verifies MatrixComputeServicer handles Intel TDX confidential compute handshake."""
+    provider = IntelTdxProvider(simulate=True)
+    servicer = MatrixComputeServicer(attestation_provider=provider)
+
+    nonce = secrets.token_bytes(32)
+    client_pubkey = secrets.token_bytes(32)
+
+    req = pb2.TileTaskRequest(
+        task_id="task-tdx-provider-001",
+        matrix_a_rows=64,
+        matrix_a_cols=64,
+        matrix_b_cols=64,
+        dtype="fp32",
+        require_confidential_compute=True,
+        client_ephemeral_pubkey=client_pubkey,
+        attestation_nonce=nonce,
+        required_tee_type="intel-tdx",
+    )
+
+    ack = servicer.RequestTileTask(req)
+    assert ack.is_ready is True
+    assert ack.tee_type == "intel-tdx"
+    assert len(ack.worker_ephemeral_pubkey) == 32
+    assert len(ack.attestation_evidence) > 0
+
+    ev = AttestationEvidence.from_bytes(ack.attestation_evidence)
+    assert ev.provider == "intel-tdx"
+    assert ev.token_claims["nonce"] == nonce.hex()
+    worker_pubkey_hash = hashlib.sha256(ack.worker_ephemeral_pubkey).hexdigest()
+    assert ev.token_claims["ephemeral_pubkey_hash"] == worker_pubkey_hash
+
 
