@@ -14,10 +14,10 @@ def test_default_config(clean_env):
     assert cfg.sats_per_gflop == 0.0005
     assert cfg.min_task_sats == 10
     assert cfg.dtype_preference == "fp32"
-    assert cfg.settlement_api_url == "http://127.0.0.1:8080"
+    assert cfg.settlement_api_url == "https://settlement.matrix-compute.net"
     assert cfg.settlement_verification_key == "settlement_secret_key_dev"
     assert len(cfg.worker_privkey_hex) == 64
-    assert len(cfg.nostr_relays) >= 1
+    assert cfg.nostr_relays == ["wss://relay.matrix-compute.net"]
 
 
 def test_effective_p2p_multiaddr_default(clean_env):

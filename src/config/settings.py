@@ -29,14 +29,17 @@ class NodeConfig(BaseModel):
     p2p_port: int = Field(50051, description="P2P gRPC server binding port")
     p2p_multiaddr: Optional[str] = Field(None, description="Explicit libp2p multiaddr")
     lightning_routing_pubkey: Optional[str] = Field(
-        None, description="Lightning node pubkey for routing payments"
+        None, description="Lightning node pubkey or Lightning Address for routing payments"
+    )
+    worker_lightning_address: Optional[str] = Field(
+        None, description="Worker Lightning Address (user@domain) or pubkey for payouts"
     )
     nostr_relays: List[str] = Field(
-        default_factory=lambda: ["ws://127.0.0.1:8008"],
+        default_factory=lambda: ["wss://relay.matrix-compute.net"],
         description="Nostr discovery relay WebSocket URLs",
     )
     settlement_api_url: str = Field(
-        "http://127.0.0.1:8080", description="Settlement layer base HTTP URL"
+        "https://settlement.matrix-compute.net", description="Settlement layer base HTTP URL"
     )
     settlement_verification_key: str = Field(
         "settlement_secret_key_dev", description="L402 Macaroon HMAC verification key"
@@ -105,6 +108,14 @@ class NodeConfig(BaseModel):
                 "MATRIX_WORKER_LIGHTNING_ROUTING_PUBKEY",
                 "LIGHTNING_ROUTING_PUBKEY",
                 "WORKER_LIGHTNING_PUBKEY",
+                "MATRIX_WORKER_LIGHTNING_ADDRESS",
+                "WORKER_LIGHTNING_ADDRESS",
+            ],
+            "worker_lightning_address": [
+                "MATRIX_WORKER_LIGHTNING_ADDRESS",
+                "WORKER_LIGHTNING_ADDRESS",
+                "MATRIX_LIGHTNING_ROUTING_PUBKEY",
+                "WORKER_LIGHTNING_PUBKEY",
             ],
             "nostr_relays": ["MATRIX_NOSTR_RELAYS", "MATRIX_WORKER_NOSTR_RELAYS", "NOSTR_RELAYS"],
             "settlement_api_url": [
@@ -143,9 +154,10 @@ class NodeConfig(BaseModel):
                 "MATRIX_INJECT_FRAUD",
                 "INJECT_FRAUD",
             ],
-            "nat_mode": ["MATRIX_NAT_MODE", "NAT_MODE"],
+            "nat_mode": ["MATRIX_NAT_MODE", "MATRIX_WORKER_NAT_MODE", "NAT_MODE"],
             "relay_grpc_endpoint": [
                 "MATRIX_RELAY_GRPC_ENDPOINT",
+                "MATRIX_WORKER_RELAY_GRPC_ENDPOINT",
                 "RELAY_GRPC_ENDPOINT",
                 "MATRIX_RELAY_ENDPOINT",
                 "RELAY_ENDPOINT",
@@ -226,6 +238,17 @@ class NodeConfig(BaseModel):
         is_nat = bool(self.enable_outbound_nat or self.nat_mode == "reverse_tunnel")
         if not is_nat and self.p2p_port == 0:
             raise ValueError("p2p_port must be between 1 and 65535 when nat_mode is direct, got 0")
+        if is_nat and not self.relay_grpc_endpoint and self.nostr_relays:
+            try:
+                parsed = urlparse(str(self.nostr_relays[0]))
+                if parsed.hostname:
+                    self.relay_grpc_endpoint = f"{parsed.hostname}:9090"
+            except Exception:
+                pass
+        if self.worker_lightning_address and not self.lightning_routing_pubkey:
+            self.lightning_routing_pubkey = self.worker_lightning_address
+        elif self.lightning_routing_pubkey and not self.worker_lightning_address:
+            self.worker_lightning_address = self.lightning_routing_pubkey
         return self
 
     @field_validator("attestation_provider")
@@ -398,6 +421,14 @@ class NodeConfig(BaseModel):
                 "MATRIX_WORKER_LIGHTNING_ROUTING_PUBKEY",
                 "LIGHTNING_ROUTING_PUBKEY",
                 "WORKER_LIGHTNING_PUBKEY",
+                "MATRIX_WORKER_LIGHTNING_ADDRESS",
+                "WORKER_LIGHTNING_ADDRESS",
+            ],
+            "worker_lightning_address": [
+                "MATRIX_WORKER_LIGHTNING_ADDRESS",
+                "WORKER_LIGHTNING_ADDRESS",
+                "MATRIX_LIGHTNING_ROUTING_PUBKEY",
+                "WORKER_LIGHTNING_PUBKEY",
             ],
             "nostr_relays": ["MATRIX_NOSTR_RELAYS", "MATRIX_WORKER_NOSTR_RELAYS", "NOSTR_RELAYS"],
             "settlement_api_url": [
@@ -434,9 +465,10 @@ class NodeConfig(BaseModel):
                 "MATRIX_INJECT_FRAUD",
                 "INJECT_FRAUD",
             ],
-            "nat_mode": ["MATRIX_NAT_MODE", "NAT_MODE"],
+            "nat_mode": ["MATRIX_NAT_MODE", "MATRIX_WORKER_NAT_MODE", "NAT_MODE"],
             "relay_grpc_endpoint": [
                 "MATRIX_RELAY_GRPC_ENDPOINT",
+                "MATRIX_WORKER_RELAY_GRPC_ENDPOINT",
                 "RELAY_GRPC_ENDPOINT",
                 "MATRIX_RELAY_ENDPOINT",
                 "RELAY_ENDPOINT",

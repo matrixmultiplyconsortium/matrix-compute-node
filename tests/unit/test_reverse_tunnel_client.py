@@ -70,14 +70,14 @@ def test_node_config_nat_settings_and_circuit_multiaddr():
         worker_privkey_hex=signer.get_privkey_hex(),
         p2p_port=0,
         enable_outbound_nat=True,
-        relay_grpc_endpoint="relay.matrixcompute.io:9090",
+        relay_grpc_endpoint="relay.matrix-compute.net:9090",
     )
     assert config.nat_mode == "reverse_tunnel"
     assert config.enable_outbound_nat is True
     assert config.p2p_port == 0
 
     multiaddr = config.resolve_advertised_multiaddr()
-    expected = f"/dns4/relay.matrixcompute.io/tcp/9090/p2p-circuit/p2p/{pub}"
+    expected = f"/dns4/relay.matrix-compute.net/tcp/9090/p2p-circuit/p2p/{pub}"
     assert multiaddr == expected
 
     # Test IP4 format

@@ -289,7 +289,8 @@ class ReverseTunnelClient:
 
             ack = first_msg.ack
             if not ack.is_accepted:
-                raise PermissionError(f"Tunnel registration rejected by relay: {ack.error_message}")
+                err_msg = getattr(ack, "message", "") or getattr(ack, "error_message", "")
+                raise PermissionError(f"Tunnel registration rejected by relay: {err_msg}")
 
             self.tunnel_id = first_msg.tunnel_id
             self.is_connected = True

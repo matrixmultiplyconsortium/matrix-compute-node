@@ -219,10 +219,19 @@ class NostrRelayClient:
         """Sends ["EVENT", event] over WebSocket and waits for NIP-20 ["OK", id, bool, msg]."""
         import asyncio
         import concurrent.futures
+        import ssl
         import websockets
 
+        ssl_ctx = None
+        if ws_url.lower().startswith("wss://"):
+            try:
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ssl_ctx = ssl.create_default_context()
+
         async def _send() -> bool:
-            async with websockets.connect(ws_url, ping_interval=None, open_timeout=self.timeout) as ws:
+            async with websockets.connect(ws_url, ssl=ssl_ctx, ping_interval=None, open_timeout=self.timeout) as ws:
                 await ws.send(json.dumps(["EVENT", event]))
                 raw = await asyncio.wait_for(ws.recv(), timeout=self.timeout)
                 msg = json.loads(raw)
