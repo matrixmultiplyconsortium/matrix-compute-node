@@ -501,6 +501,32 @@ class MatrixComputeServicer(pb2_grpc.MatrixComputeServiceServicer):
                 payload_to_sign = f"{task_id}:{c_hash}".encode("utf-8")
                 sig = self.signer.sign_message(payload_to_sign)
 
+            locked_sats_display = "trial" if is_trial else "paid"
+            if not is_trial:
+                try:
+                    import base64
+                    import json
+                    raw_m = base64.b64decode(macaroon_b64)
+                    m_obj = json.loads(raw_m.decode("utf-8"))
+                    m_cav = m_obj.get("caveats", {}) if isinstance(m_obj, dict) else {}
+                    if "locked_sats" in m_cav:
+                        locked_sats_display = str(m_cav["locked_sats"])
+                except Exception:
+                    pass
+
+            logger.info(
+                "[TILE COMPLETED] task=%s (%dx%d @ %dx%d %s) in %d ms | batch_escrow=%s sats (hash=%s...)",
+                task_id,
+                m,
+                k,
+                k,
+                n,
+                dtype,
+                max(exec_time_ms, 1),
+                locked_sats_display,
+                payment_hash[:12],
+            )
+
             return pb2.TileResult(
                 task_id=task_id,
                 rows=session.m,

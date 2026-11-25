@@ -105,6 +105,55 @@ class WorkerDaemon:
             relays=config.nostr_relays,
             signer=self.signer,
         )
+        self._last_payout_snapshot: Optional[tuple] = None
+
+    def _log_payout_status(self, force: bool = False) -> None:
+        """Queries settlement /payouts/<address> and logs whenever accumulated or paid satoshis change."""
+        payout_addr = (
+            getattr(self.config, "worker_lightning_address", None)
+            or getattr(self.config, "lightning_routing_pubkey", None)
+        )
+        settlement_url = getattr(self.config, "settlement_api_url", None)
+        if not payout_addr or not settlement_url or not str(settlement_url).startswith(("http://", "https://")):
+            return
+        try:
+            import httpx
+            url = f"{str(settlement_url).rstrip('/')}/payouts/{payout_addr}"
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(url)
+                if resp.status_code != 200:
+                    return
+                data = resp.json()
+            if not isinstance(data, dict):
+                return
+            pending_gross = int(data.get("pending_gross_sats", 0))
+            est_net = int(data.get("estimated_pending_net_sats", pending_gross))
+            threshold = int(data.get("min_payout_threshold_sats", 1000))
+            total_paid = int(data.get("total_paid_net_sats", 0))
+            payout_count = int(data.get("payout_count", 0))
+            snapshot = (pending_gross, total_paid, payout_count)
+            if force or snapshot != self._last_payout_snapshot:
+                prev_paid = self._last_payout_snapshot[1] if self._last_payout_snapshot else 0
+                self._last_payout_snapshot = snapshot
+                if total_paid > prev_paid:
+                    logger.info(
+                        "[LIGHTNING PAYOUT SENT] Dispatched %d net sats to %s! (Lifetime paid: %d sats across %d payouts)",
+                        total_paid - prev_paid,
+                        payout_addr,
+                        total_paid,
+                        payout_count,
+                    )
+                logger.info(
+                    "[EARNINGS] Pending: %d / %d sats (~%d net sats) | Paid to %s: %d sats (%d payouts)",
+                    pending_gross,
+                    threshold,
+                    est_net,
+                    payout_addr,
+                    total_paid,
+                    payout_count,
+                )
+        except Exception as ex:
+            logger.debug("Payout status check skipped: %s", ex)
 
     def start(self) -> None:
         """Starts daemon services and registers announcement."""
@@ -130,6 +179,7 @@ class WorkerDaemon:
 
         # 3. Announce to Nostr relays
         self._announce_once()
+        self._log_payout_status(force=True)
 
     def _announce_once(self) -> bool:
         """Builds and publishes a fresh Kind 30000 announcement event."""
@@ -188,6 +238,7 @@ class WorkerDaemon:
                 time.sleep(0.5)
                 if time.time() - last_announce >= 30.0:
                     self._announce_once()
+                    self._log_payout_status(force=False)
                     last_announce = time.time()
         except KeyboardInterrupt:
             pass
