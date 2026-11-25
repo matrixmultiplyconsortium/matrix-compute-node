@@ -45,7 +45,7 @@ def _ensure_contracts_linked() -> None:
 # Link matrix_contracts immediately upon package initialization
 _ensure_contracts_linked()
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "__version__",

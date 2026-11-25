@@ -748,6 +748,21 @@ class NodeConfig(BaseModel):
                 merged["nat_mode"] = "reverse_tunnel"
                 merged["p2p_port"] = 0
 
+        # When launched via CLI without explicit pricing overrides, default to competitive mainnet pricing
+        explicit_rate = "sats_per_gflop" in cli_dict or any(
+            environ.get(ev) not in (None, "")
+            for ev in ("MATRIX_SATS_PER_GFLOP", "MATRIX_WORKER_SATS_PER_GFLOP", "SATS_PER_GFLOP")
+        )
+        if not explicit_rate:
+            merged["sats_per_gflop"] = 0.00001
+
+        explicit_min_sats = "min_task_sats" in cli_dict or any(
+            environ.get(ev) not in (None, "")
+            for ev in ("MATRIX_MIN_TASK_SATS", "MATRIX_WORKER_MIN_TASK_SATS", "MIN_TASK_SATS")
+        )
+        if not explicit_min_sats:
+            merged["min_task_sats"] = 1
+
         return cls(**merged)
 
     # Alias for backwards-compatibility and CLI invocations
