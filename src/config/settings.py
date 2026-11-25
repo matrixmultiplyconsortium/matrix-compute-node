@@ -723,6 +723,31 @@ class NodeConfig(BaseModel):
         merged = {**base_config, **cli_dict}
         if merged.get("enable_outbound_nat") and merged.get("nat_mode") in (None, "direct", ""):
             merged["nat_mode"] = "reverse_tunnel"
+
+        # When launched via CLI without explicit NAT/port overrides against a public relay,
+        # default to outbound reverse_tunnel so residential/NATed nodes remain reachable.
+        environ = os.environ if env is None else env
+        explicit_nat_or_port = any(
+            k in cli_dict for k in ("nat_mode", "p2p_port", "p2p_multiaddr", "enable_outbound_nat")
+        ) or any(
+            environ.get(ev) not in (None, "")
+            for ev in (
+                "MATRIX_NAT_MODE", "MATRIX_WORKER_NAT_MODE", "NAT_MODE",
+                "MATRIX_P2P_PORT", "MATRIX_WORKER_P2P_PORT", "P2P_PORT",
+                "MATRIX_P2P_MULTIADDR", "MATRIX_WORKER_P2P_MULTIADDR", "P2P_MULTIADDR",
+                "MATRIX_ENABLE_OUTBOUND_NAT", "ENABLE_OUTBOUND_NAT",
+            )
+        )
+        if not explicit_nat_or_port:
+            relays = merged.get("nostr_relays") or []
+            is_public_relay = any(
+                urlparse(str(r)).hostname not in (None, "", "127.0.0.1", "localhost", "0.0.0.0", "relay")
+                for r in relays
+            )
+            if is_public_relay:
+                merged["nat_mode"] = "reverse_tunnel"
+                merged["p2p_port"] = 0
+
         return cls(**merged)
 
     # Alias for backwards-compatibility and CLI invocations
